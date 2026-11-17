@@ -11,7 +11,7 @@
 
 [![Windows x64](https://img.shields.io/badge/Windows_x64-v1.1.0-186B77?style=flat-square)](https://github.com/xuilen/multiwork/releases/download/v1.1.0/multiwork-1.1.0-windows-x64.zip) [![Electron](https://img.shields.io/badge/Electron-39-293442?style=flat-square&logo=electron)](desktop/package.json) [![License](https://img.shields.io/badge/License-Apache_2.0-426457?style=flat-square)](LICENSE)
 
-**[下载 Windows 版](https://github.com/xuilen/multiwork/releases/download/v1.1.0/multiwork-1.1.0-windows-x64.zip)** · [版本说明](https://github.com/xuilen/multiwork/releases/tag/v1.1.0) · [English](README.md)
+**[访问产品官网](https://xuilen.github.io/multiwork/)** · **[下载 Windows 版](https://github.com/xuilen/multiwork/releases/download/v1.1.0/multiwork-1.1.0-windows-x64.zip)** · [版本说明](https://github.com/xuilen/multiwork/releases/tag/v1.1.0) · [English](README.md)
 
 </div>
 
@@ -52,4 +52,4 @@ npm --prefix desktop run dev
 
 ## 来源与许可
 
-multiwork 基于 [Meldwork](https://github.com/Ryder-Sun/Meldwork) 开发，沿用 Apache License 2.0。原作者和第三方标识的归属记录在随包分发的声明中。[许可证](LICENSE) · [版权声明](NOTICE) · [商业使用](COMMERCIAL_USE.md)
+此发行项目由 xuilen 独立维护，公开提交历史从 Windows 发行快照开始。应用基于 [Meldwork](https://github.com/Ryder-Sun/Meldwork) 开发，沿用 Apache License 2.0。原作者和第三方标识的归属记录在随包分发的声明中。[许可证](LICENSE) · [版权声明](NOTICE) · [商业使用](COMMERCIAL_USE.md)

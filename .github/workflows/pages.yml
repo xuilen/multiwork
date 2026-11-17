@@ -1,0 +1,33 @@
+name: Publish multiwork website
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'meldwork-landing/**'
+      - '.github/workflows/pages.yml'
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - name: Collect public website files
+        run: |
+          mkdir "$RUNNER_TEMP/site"
+          cp -r meldwork-landing/{assets,index.html,styles.css,main.js,i18n.js,glyph-embers.js,LICENSE,NOTICE,COMMERCIAL_USE.md} "$RUNNER_TEMP/site/"
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/site
+      - id: deployment
+        uses: actions/deploy-pages@v4

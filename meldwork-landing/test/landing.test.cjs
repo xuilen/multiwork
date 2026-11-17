@@ -42,6 +42,22 @@ test('release metadata, downloads, official logo and commercial licensing stay c
   }
 })
 
+test('published product page links to its live URL, screenshot and upstream credits', () => {
+  const p = page()
+  try {
+    const { doc } = p
+    assert.equal(doc.querySelector('link[rel=canonical]').href, 'https://xuilen.github.io/multiwork/')
+    const imagePath = doc.querySelector('#product figure img').getAttribute('src')
+    assert.equal(doc.querySelector('#product figure a').getAttribute('href'), imagePath)
+    assert.ok(readFileSync(path.join(root, imagePath)).length > 0)
+    for (const language of ['en', 'zh']) {
+      p.window.meldworkI18n.setLocale(language)
+      assert.ok(doc.querySelector('footer a[href="https://github.com/Ryder-Sun/Meldwork"]'))
+      assert.ok(doc.querySelector('.hero a[href="#product"]'))
+    }
+  } finally { p.dom.window.close() }
+})
+
 function page({ language = 'en', saved, reduced = false, blockedStorage = false } = {}) {
   const dom = new JSDOM(html, { url: 'https://meldwork.test/', runScripts: 'outside-only', pretendToBeVisual: true })
   const { window } = dom

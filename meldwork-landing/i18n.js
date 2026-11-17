@@ -14,6 +14,7 @@
     return { el: el, en: el.innerHTML, zh: el.dataset.zh };
   });
   var labels = {
+    "Codex and Claude Code reviewing a Windows release in multiwork": "Codex 和 Claude Code 在 multiwork 中讨论 Windows 版本发布",
     "Agent activity": "Agent 协作状态",
     "multiwork home": "multiwork 首页", "Primary": "主导航", "Mobile": "移动端导航",
     "Toggle theme": "切换明暗主题", "Menu": "菜单", "Playback mode": "播放模式",

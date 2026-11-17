@@ -1340,6 +1340,16 @@ html:lang(zh-CN) .t-bubble p { line-height: 1.9; }
 [data-theme="light"] .t-bubble-hermes { --agent-color: #936743; }
 [data-theme="light"] .t-bubble-ocr { --agent-color: #427b62; }
 
+.workspace-preview { max-width: 1040px; margin: 2.5rem auto 0; }
+.workspace-preview img {
+  display: block; width: 100%; height: auto; border: 1px solid var(--line-strong);
+  border-radius: 16px; box-shadow: 0 18px 48px rgba(0, 0, 0, .16);
+}
+.workspace-preview figcaption { margin-top: .8rem; color: var(--muted); text-align: center; }
+.workspace-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 2rem; max-width: 1040px; margin: 2.5rem auto; }
+.workspace-details article { border-top: 1px solid var(--line-strong); padding-top: 1rem; }
+.workspace-details article p { color: var(--ink-soft); line-height: 1.6; margin-top: .6rem; }
+
 /* ---- CardSwap screenshots (React Bits port) ---- */
 .card-swap-stage {
   margin-top: clamp(48px, 7vh, 72px);

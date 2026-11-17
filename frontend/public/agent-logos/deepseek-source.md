@@ -5,4 +5,4 @@
 
 Upstream project: https://github.com/deepseek-ai/deepseek-harness
 
-The icon identifies the third-party application; it is not a Meldwork logo.
+The icon identifies the third-party DeepSeek application within multiwork.

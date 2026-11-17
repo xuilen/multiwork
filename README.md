@@ -11,7 +11,7 @@ Give Codex, Claude Code and API-connected models the same task. Follow each repl
 
 [![Windows x64](https://img.shields.io/badge/Windows_x64-v1.1.0-186B77?style=flat-square)](https://github.com/xuilen/multiwork/releases/download/v1.1.0/multiwork-1.1.0-windows-x64.zip) [![Electron](https://img.shields.io/badge/Electron-39-293442?style=flat-square&logo=electron)](desktop/package.json) [![License](https://img.shields.io/badge/License-Apache_2.0-426457?style=flat-square)](LICENSE)
 
-**[Download for Windows](https://github.com/xuilen/multiwork/releases/download/v1.1.0/multiwork-1.1.0-windows-x64.zip)** · [Release notes](https://github.com/xuilen/multiwork/releases/tag/v1.1.0) · [简体中文](README.zh-CN.md)
+**[Explore the website](https://xuilen.github.io/multiwork/)** · **[Download for Windows](https://github.com/xuilen/multiwork/releases/download/v1.1.0/multiwork-1.1.0-windows-x64.zip)** · [Release notes](https://github.com/xuilen/multiwork/releases/tag/v1.1.0) · [简体中文](README.zh-CN.md)
 
 </div>
 
@@ -52,4 +52,4 @@ npm --prefix desktop run dev
 
 ## Credits and license
 
-multiwork builds on [Meldwork](https://github.com/Ryder-Sun/Meldwork) and is distributed under the Apache License 2.0. The distribution includes the original copyright and third-party notices. [License](LICENSE) · [Notices](NOTICE) · [Commercial use](COMMERCIAL_USE.md)
+xuilen independently maintains this distribution of multiwork. Its public history starts with the Windows distribution snapshot. The application builds on [Meldwork](https://github.com/Ryder-Sun/Meldwork) and is distributed under the Apache License 2.0. The distribution includes the original copyright and third-party notices. [License](LICENSE) · [Notices](NOTICE) · [Commercial use](COMMERCIAL_USE.md)

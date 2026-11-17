@@ -1,10 +1,10 @@
-# DESIGN.md — Meldwork
+# DESIGN.md — multiwork
 
-Meldwork's own design system, extracted from the shipped app (`frontend/src/styles/base-foundation.css`) and the v3 Trace brand marks. Generated per the Google Stitch DESIGN.md format (design-md skill). All landing/marketing UI must consume these tokens exactly.
+multiwork's own design system, extracted from the shipped app (`frontend/src/styles/base-foundation.css`) and the v3 Trace brand marks. Generated per the Google Stitch DESIGN.md format (design-md skill). All landing/marketing UI must consume these tokens exactly.
 
 ## 1. Visual Theme & Atmosphere
 
-Dark, quiet, instrument-panel calm. Meldwork is a local-first workspace where selected Agents collaborate to advance a shared task. The visual language connects their contributions: a near-black field, a faint dot-matrix of participants, one continuous coral work line, and generous negative space. Density is low; motion is slow and deliberate; nothing loops aggressively. Retro dot-matrix display type signals the "run state / terminal" heritage without becoming a gimmick.
+Dark, quiet, instrument-panel calm. multiwork is a local-first workspace where selected Agents collaborate to advance a shared task. The visual language connects their contributions: a near-black field, a faint dot-matrix of participants, one continuous coral work line, and generous negative space. Density is low; motion is slow and deliberate; nothing loops aggressively. Retro dot-matrix display type signals the "run state / terminal" heritage without becoming a gimmick.
 
 Marketing copy leads with "Set the goal. Let Agents work together." Emphasize shared context, discussion, authorized execution, peer review, and less manual coordination. Users set goals and permissions and step in when information or key decisions are needed. Local history supports revisiting the work; do not promise complete evidence traceability, guaranteed correctness, or tasks completing without human input.
 

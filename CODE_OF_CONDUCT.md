@@ -1,6 +1,6 @@
 # Code of Conduct
 
-Meldwork is a workspace for people and Agents to build together. We want issues,
+multiwork is a workspace for people and Agents to build together. We want issues,
 pull requests, discussions, and community spaces to stay useful, direct, and
 respectful.
 
@@ -15,7 +15,7 @@ respectful.
 
 ## Unacceptable Behavior
 
-The following behavior is not acceptable in Meldwork project spaces:
+The following behavior is not acceptable in multiwork project spaces:
 
 - Personal attacks, insults, harassment, or sustained disruption.
 - Demeaning comments about identity, background, language, ability, or experience.
@@ -47,5 +47,5 @@ Reports will be reviewed by project maintainers. We will handle reports with
 care and limit access to people who need the information to respond.
 
 This Code of Conduct applies wherever the project or its maintainers represent
-the Meldwork community. It is adapted from the Contributor Covenant and the
+the multiwork community. It is adapted from the Contributor Covenant and the
 community standards used by comparable open-source projects.
