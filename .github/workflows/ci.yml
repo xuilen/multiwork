@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-process-tree:
+    name: Windows process tree termination
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22.12"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: desktop
+
+      - name: Test actual process tree termination
+        run: node --test desktop/test/agents/cli/windows-process-tree.test.cjs
+
+      - name: Test native environment key casing
+        run: node --test --test-name-pattern="Windows native environment canonicalizes" desktop/test/agents/local-agent-readiness.test.cjs
+
+      - name: Test selected native configuration directories
+        run: node --test desktop/test/agents/native-config-directory.test.cjs
+
+      - name: Test Skills in selected native directories
+        run: node --test --test-name-pattern="selected native directories control" desktop/test/skills/local-skill-catalog.test.cjs
+
+      - name: Test Connector package storage
+        run: node --test --test-name-pattern="persists the complete trust lifecycle|reimporting a removed package|uncertain audit append|upgrades one installed Connector" desktop/test/agents/connectors/agent-connector-package-store.test.cjs
+
+      - name: Build unpacked Windows application
+        run: npm run pack
+        working-directory: desktop
+
+      - name: Test packaged process tree termination
+        shell: pwsh
+        run: |
+          $env:ELECTRON_RUN_AS_NODE = '1'
+          $env:MELDWORK_TEST_PACKAGED_APP = (Resolve-Path 'desktop/dist/multiwork/win-unpacked/resources/app.asar').Path
+          & 'desktop/dist/multiwork/win-unpacked/multiwork.exe' --test desktop/test/agents/cli/windows-process-tree.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  private-file-portability:
+    name: Private file portability (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22.12"
+
+      - name: Test private file persistence
+        run: node --test desktop/test/security/private-file.test.cjs
+
+  frontend:
+    name: Frontend tests and builds
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22.12"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Check website and release licensing consistency
+        run: node --test ../meldwork-landing/test/landing.test.cjs
+
+      - name: Build web application
+        run: npm run build
+
+      - name: Build desktop renderer
+        run: npm run build:desktop
+
+  desktop:
+    name: Desktop tests and package validation
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22.12"
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: desktop
+
+      - name: Run desktop tests
+        run: npm test
+        working-directory: desktop
+
+      - name: Run deterministic Eval Harness
+        run: npm run eval:deterministic
+        working-directory: desktop
+
+      - name: Build unpacked desktop application
+        run: npm run pack
+        working-directory: desktop

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 270 72" role="img" aria-labelledby="title">
+  <title id="title">multiwork</title>
+  <g transform="translate(2 2) scale(.53)">
+  <defs>
+    <linearGradient id="tile" x2=".8" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#29394E"/><stop offset="1" stop-color="#132135"/>
+    </linearGradient>
+    <path id="ribbon" d="M61 20.5Q64 18.8 67 20.5L95.4 36.9Q98.2 38.5 95.4 40.2L80.6 48.8Q79 49.8 77.3 48.8L64 41.1L50.7 48.8Q49 49.8 47.4 48.8L32.6 40.2Q29.8 38.5 32.6 36.9Z"/>
+    <path id="fold" d="M64 19.7Q65.5 19.7 67 20.5L95.4 36.9Q98.2 38.5 95.4 40.2L80.6 48.8Q79 49.8 77.3 48.8L64 41.1Z"/>
+  </defs>
+  <rect x="2" y="2" width="124" height="124" rx="29" fill="url(#tile)" stroke="#52667A" stroke-width="1.5"/>
+  <g transform="translate(0 1)">
+    <use href="#ribbon" fill="#D7F2F2"/><use href="#fold" fill="#B1D7E1"/>
+    <g transform="rotate(120 64 64)"><use href="#ribbon" fill="#77E0CE"/><use href="#fold" fill="#47B9B1"/></g>
+    <g transform="rotate(240 64 64)"><use href="#ribbon" fill="#A9B4FA"/><use href="#fold" fill="#8596E2"/></g>
+  </g>
+  </g>
+  <text x="81" y="51" fill="#17191C" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="43" font-weight="650" letter-spacing="-2">multiwork</text>
+</svg>

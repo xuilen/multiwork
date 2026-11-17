@@ -1,0 +1,1966 @@
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { EventEmitter } = require('node:events')
+const { PassThrough } = require('node:stream')
+const { launchEnvironment, probeAgentCapabilities } = require('../../../src/agents/cli/cli-discovery.cjs')
+const {
+  detectAgents,
+  imageAttachmentLimit,
+  invocation,
+  parseCodexOutput,
+  parseGeminiOutput,
+  parseKimiOutput,
+  parseMimoOutput,
+  parseOpenCodeOutput,
+  parseWorkBuddyOutput,
+  prepareCommand,
+  readHermesFinalResponse,
+  readHermesMessageWatermark,
+  resolveExecutable,
+  runAgent,
+  runtimeCommandSummary,
+  searchPath,
+} = require('../../../src/agents/cli/cli-adapters.cjs')
+
+test('Hermes discovery redacts configured credentials even when their names are unconventional', async () => {
+  const agents = await detectAgents({
+    platform: 'darwin', env: {},
+    resolveExecutableFn: async kind => kind === 'hermes' ? '/tmp/hermes' : null,
+    nativeEnvironmentForKind: kind => kind === 'hermes' ? { CUSTOM_CREDENTIAL: 'abc' } : {},
+    nativeCredentialKeysForKind: kind => kind === 'hermes' ? ['CUSTOM_CREDENTIAL'] : [],
+    execFileFn: async (_command, args) => ({ stdout: args[0] === '--version' ? 'Hermes 0.19.1 abc\n' : '', stderr: '' }),
+    probeAgentCapabilitiesFn: async () => ({ compatibilityState: 'compatible' }),
+  })
+  assert.equal(agents.length, 1)
+  assert.doesNotMatch(JSON.stringify(agents), /abc/)
+})
+
+test('default discovery redacts short native credentials from CLI version output', async () => {
+  const agents = await detectAgents({
+    platform: 'darwin', env: { OPENAI_API_KEY: 'abc' },
+    resolveExecutableFn: async kind => kind === 'kimi' ? '/tmp/kimi' : null,
+    execFileFn: async () => ({ stdout: 'Kimi Code 0.19.2 abc', stderr: '' }),
+    probeAgentCapabilitiesFn: async () => ({ compatibilityState: 'compatible' }),
+  })
+  assert.equal(agents.length, 1)
+  assert.doesNotMatch(JSON.stringify(agents), /abc/)
+})
+
+test('default discovery passes only each Agent native environment to version and capability probes', async () => {
+  const observed = new Map()
+  const env = { ANTHROPIC_API_KEY: 'claude-key', AWS_PROFILE: 'cloud-profile',
+    GEMINI_API_KEY: 'gemini-key', OPENAI_API_KEY: 'openai-private', CUSTOM_CREDENTIAL: 'pi-private', HTTPS_PROXY: 'http://proxy.example:3128' }
+  await detectAgents({ platform: 'darwin', env,
+    resolveExecutableFn: async kind => ['claude', 'gemini', 'pi', 'openclaw'].includes(kind) ? `/tmp/${kind}` : null,
+    nativeCredentialKeysForKind: kind => kind === 'pi' ? ['CUSTOM_CREDENTIAL'] : [],
+    execFileFn: async (command, _args, options) => {
+      observed.set(path.basename(command), options.env)
+      return { stdout: '', stderr: '' }
+    },
+    probeAgentCapabilitiesFn: async (_kind, _executable, options) => {
+      assert.ok(options.childEnv)
+      return { compatibilityState: 'compatible' }
+    },
+  })
+  assert.equal(observed.get('claude').AWS_PROFILE, 'cloud-profile')
+  assert.equal(observed.get('claude').GEMINI_API_KEY, undefined)
+  assert.equal(observed.get('gemini').GEMINI_API_KEY, 'gemini-key')
+  assert.equal(observed.get('gemini').ANTHROPIC_API_KEY, undefined)
+  assert.equal(observed.get('pi').CUSTOM_CREDENTIAL, 'pi-private')
+  assert.equal(observed.get('openclaw').ANTHROPIC_API_KEY, undefined)
+  assert.equal(observed.get('openclaw').OPENAI_API_KEY, undefined)
+  for (const child of observed.values()) assert.equal(child.HTTPS_PROXY, env.HTTPS_PROXY)
+})
+
+test('discovery scans version-manager directories once per pass and rescans on refresh', async () => {
+  let scans = 0
+  const options = {
+    platform: 'linux', home: '/tmp/meldwork-discovery-test', env: { PATH: '' },
+    readdirFn: () => { scans++; return [] },
+    accessFn: async () => { throw new Error('not found') },
+    execFileFn: async () => { throw new Error('not found') },
+  }
+  await detectAgents(options)
+  assert.equal(scans, 2)
+  await detectAgents(options)
+  assert.equal(scans, 4)
+})
+const {
+  executable,
+  readJsonWhenReady,
+  readWhenReady,
+  waitForExit,
+  within,
+  workBuddyInstall,
+} = require('../../support/cli-adapters-test-helpers.cjs')
+
+test('search path includes common user CLI locations', () => {
+  assert.match(searchPath(), /\.local\/bin/)
+  assert.match(searchPath(), /\.kimi-code\/bin/)
+  assert.match(searchPath(), /\.mimocode\/bin/)
+})
+
+test('a WorkBuddy build that ships only the lite bundle is probed through it', async (t) => {
+  const help = '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits'
+  const probe = async (kind, launcher) => {
+    let probeEnv
+    const result = await probeAgentCapabilities(kind, launcher, {
+      env: {},
+      execFileFn: async (_command, _args, options) => {
+        probeEnv = options.env
+        return { stdout: help }
+      },
+    })
+    return { probeEnv, result }
+  }
+  const liteOnly = workBuddyInstall(t, ['codebuddy-lite-wb.mjs'])
+  const withHeadless = workBuddyInstall(t, ['codebuddy-lite-wb.mjs', 'codebuddy-headless.js', 'codebuddy.js'])
+
+  const lite = await probe('workbuddy', liteOnly)
+  assert.equal(lite.probeEnv.CODEBUDDY_FORCE_LITE_WB_BUNDLE, '1')
+  assert.equal(lite.result.compatibilityState, 'compatible')
+  assert.equal(
+    Object.hasOwn((await probe('workbuddy', withHeadless)).probeEnv, 'CODEBUDDY_FORCE_LITE_WB_BUNDLE'),
+    false,
+  )
+  assert.equal(
+    Object.hasOwn((await probe('claude', liteOnly)).probeEnv, 'CODEBUDDY_FORCE_LITE_WB_BUNDLE'),
+    false,
+  )
+  assert.deepEqual(launchEnvironment('workbuddy', path.join(os.tmpdir(), 'meldwork-no-such-cli')), {})
+  assert.deepEqual(launchEnvironment('workbuddy', ''), {})
+
+  if (process.platform !== 'win32') {
+    const linkDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'meldwork-workbuddy-link-'))
+    t.after(() => fs.rmSync(linkDirectory, { recursive: true, force: true }))
+    const link = path.join(linkDirectory, 'codebuddy')
+    fs.symlinkSync(liteOnly, link)
+    assert.deepEqual(launchEnvironment('workbuddy', link), { CODEBUDDY_FORCE_LITE_WB_BUNDLE: '1' })
+  }
+})
+
+test('capability timeouts retry once and remain inconclusive when both attempts time out', async () => {
+  for (const recover of [true, false]) {
+    const timeouts = new Map()
+    const result = await probeAgentCapabilities('pi', '/test/timeout-pi', {
+      env: {},
+      execFileFn: async (_command, _args, options) => {
+        const key = _args.includes('--mode') ? 'json' : 'help'
+        const probeTimeouts = timeouts.get(key) || []
+        probeTimeouts.push(options.timeout)
+        timeouts.set(key, probeTimeouts)
+        if (!recover || probeTimeouts.length === 1) {
+          throw Object.assign(new Error('timeout'), { killed: true })
+        }
+        return { stdout: argsForProbe(_command, _args) }
+      },
+    })
+    assert.deepEqual([...timeouts.values()], [[8000, 16000], [8000, 16000]])
+    assert.equal(result.compatibilityState, recover ? 'compatible' : 'unknown')
+    if (!recover) assert.equal(result.incompatibilityReason, 'LOCAL_AGENT_CAPABILITY_PROBE_TIMEOUT')
+  }
+})
+
+test('capability probes do not treat operating system spawn failures as missing features', async () => {
+  for (const code of ['EACCES', 'ENOENT', 'EAGAIN']) {
+    const result = await probeAgentCapabilities('workbuddy', '/test/unavailable-workbuddy', {
+      env: {}, execFileFn: async () => { throw Object.assign(new Error('spawn failed'), { code }) },
+    })
+    assert.equal(result.compatibilityState, 'unknown', code)
+    assert.equal(result.incompatibilityReason, 'LOCAL_AGENT_CAPABILITY_PROBE_FAILED', code)
+  }
+})
+
+function argsForProbe(_command, args) {
+  return args.includes('--mode')
+    ? '{"type":"session","version":3,"id":"probe-session"}'
+    : '--mode json --print --session --tools --approve --no-approve'
+}
+
+test('only unchanged recently verified executables survive inconclusive capability probes', async () => {
+  const executable = '/test/cached-workbuddy'
+  let identity = 1
+  let mode = 'success'
+  const options = {
+    env: {}, version: '2.115.0',
+    statFn: () => ({ dev: 1, ino: identity, size: 100, mtimeMs: 1, ctimeMs: 1 }),
+    execFileFn: async () => {
+      if (mode === 'timeout') throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })
+      return { stdout: mode === 'success'
+        ? '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits'
+        : 'different CLI help' }
+    },
+  }
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'compatible')
+  mode = 'timeout'
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'compatible')
+  identity = 2
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'unknown')
+  identity = 1
+  options.version = '2.132.0'
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'unknown')
+  options.version = '2.115.0'
+  mode = 'incompatible'
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'incompatible')
+  mode = 'timeout'
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'unknown')
+})
+
+test('spawn and authentication failures invalidate a previously successful capability probe', async () => {
+  let mode = 'success'
+  const options = {
+    env: {}, version: '2.115.0',
+    statFn: () => ({ dev: 1, ino: 1, size: 100, mtimeMs: 1, ctimeMs: 1 }),
+    execFileFn: async () => {
+      if (mode === 'spawn') throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+      if (mode === 'auth') throw Object.assign(new Error('Please log in first'), { code: 1 })
+      if (mode === 'timeout') throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })
+      return { stdout: '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits' }
+    },
+  }
+  const probe = () => probeAgentCapabilities('workbuddy', '/test/spawn-failure-cache', options)
+  assert.equal((await probe()).compatibilityState, 'compatible')
+  mode = 'spawn'
+  assert.equal((await probe()).compatibilityState, 'unknown')
+  mode = 'timeout'
+  assert.equal((await probe()).compatibilityState, 'unknown')
+  mode = 'success'
+  assert.equal((await probe()).compatibilityState, 'compatible')
+  mode = 'auth'
+  assert.equal((await probe()).incompatibilityReason, 'LOCAL_AGENT_AUTH_REQUIRED')
+  mode = 'timeout'
+  assert.equal((await probe()).compatibilityState, 'unknown')
+})
+
+test('a late successful probe cannot restore a cache after a newer spawn failure', async () => {
+  let release
+  const pending = new Promise(resolve => { release = resolve })
+  const options = { env: {}, version: '2.115.0',
+    statFn: () => ({ dev: 1, ino: 1, size: 100, mtimeMs: 1, ctimeMs: 1 }) }
+  const executable = '/test/parallel-probe-cache'
+  const oldProbe = probeAgentCapabilities('workbuddy', executable, { ...options,
+    execFileFn: async () => { await pending; return { stdout: '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits' } },
+  })
+  const newer = await probeAgentCapabilities('workbuddy', executable, { ...options,
+    execFileFn: async () => { throw Object.assign(new Error('permission denied'), { code: 'EACCES' }) },
+  })
+  assert.equal(newer.compatibilityState, 'unknown')
+  release()
+  assert.equal((await oldProbe).compatibilityState, 'unknown')
+  const timeout = await probeAgentCapabilities('workbuddy', executable, { ...options,
+    execFileFn: async () => { throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }) },
+  })
+  assert.equal(timeout.compatibilityState, 'unknown')
+})
+
+test('identical concurrent successful probes both remain compatible', async () => {
+  let release
+  const pending = new Promise(resolve => { release = resolve })
+  const options = { env: {}, version: '2.115.0',
+    statFn: () => ({ dev: 1, ino: 1, size: 100, mtimeMs: 1, ctimeMs: 1 }) }
+  const executable = '/test/parallel-successful-probes'
+  const help = '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits'
+  const first = probeAgentCapabilities('workbuddy', executable, { ...options,
+    execFileFn: async () => { await pending; return { stdout: help } } })
+  const second = await probeAgentCapabilities('workbuddy', executable, { ...options,
+    execFileFn: async () => ({ stdout: help }) })
+  assert.equal(second.compatibilityState, 'compatible')
+  release()
+  assert.equal((await first).compatibilityState, 'compatible')
+})
+
+test('the oldest overlapping probe follows the latest of three results', async () => {
+  let release
+  const pending = new Promise(resolve => { release = resolve })
+  const options = { env: {}, version: '2.115.0',
+    statFn: () => ({ dev: 1, ino: 1, size: 100, mtimeMs: 1, ctimeMs: 1 }) }
+  const executable = '/test/three-overlapping-probes'
+  const help = '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits'
+  const first = probeAgentCapabilities('workbuddy', executable, { ...options,
+    execFileFn: async () => { await pending; return { stdout: help } } })
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, { ...options,
+    execFileFn: async () => ({ stdout: help }) })).compatibilityState, 'compatible')
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, { ...options,
+    execFileFn: async () => { throw Object.assign(new Error('permission denied'), { code: 'EACCES' }) },
+  })).compatibilityState, 'unknown')
+  release()
+  assert.equal((await first).compatibilityState, 'unknown')
+})
+
+test('a superseded probe does not reuse a newer executable identity', async () => {
+  let release
+  const pending = new Promise(resolve => { release = resolve })
+  const stat = ino => () => ({ dev: 1, ino, size: 100, mtimeMs: 1, ctimeMs: 1 })
+  const executable = '/test/parallel-replaced-executable'
+  const help = '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits'
+  const first = probeAgentCapabilities('workbuddy', executable, { env: {}, version: '2.115.0',
+    statFn: stat(1), execFileFn: async () => { await pending; return { stdout: help } } })
+  const second = await probeAgentCapabilities('workbuddy', executable, { env: {}, version: '2.115.0',
+    statFn: stat(2), execFileFn: async () => ({ stdout: help }) })
+  assert.equal(second.compatibilityState, 'compatible')
+  release()
+  assert.equal((await first).compatibilityState, 'unknown')
+})
+
+test('a late spawn failure cannot erase a newer successful probe cache', async () => {
+  let release
+  const pending = new Promise(resolve => { release = resolve })
+  const options = { env: {}, version: '2.115.0',
+    statFn: () => ({ dev: 1, ino: 1, size: 100, mtimeMs: 1, ctimeMs: 1 }) }
+  const executable = '/test/parallel-probe-failure'
+  const oldProbe = probeAgentCapabilities('workbuddy', executable, { ...options,
+    execFileFn: async () => { await pending; throw Object.assign(new Error('permission denied'), { code: 'EACCES' }) },
+  })
+  const newer = await probeAgentCapabilities('workbuddy', executable, { ...options,
+    execFileFn: async () => ({ stdout: '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits' }),
+  })
+  assert.equal(newer.compatibilityState, 'compatible')
+  release()
+  assert.equal((await oldProbe).compatibilityState, 'compatible')
+  const timeout = await probeAgentCapabilities('workbuddy', executable, { ...options,
+    execFileFn: async () => { throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }) },
+  })
+  assert.equal(timeout.compatibilityState, 'compatible')
+})
+
+
+test('capability probe cache expires when the system clock moves backwards', async t => {
+  let now = 10_000
+  t.mock.method(Date, 'now', () => now)
+  let timeout = false
+  const options = {
+    env: {}, version: '2.115.0',
+    statFn: () => ({ dev: 1, ino: 1, size: 100, mtimeMs: 1, ctimeMs: 1 }),
+    execFileFn: async () => {
+      if (timeout) throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })
+      return { stdout: '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits' }
+    },
+  }
+  const executable = '/test/cached-clock-workbuddy'
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'compatible')
+  timeout = true
+  now -= 1000
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'unknown')
+})
+
+test('capability probe cache does not survive native configuration file changes', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'meldwork-capability-config-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const config = path.join(root, 'settings.json')
+  fs.writeFileSync(config, '{}')
+  let timeout = false
+  const options = {
+    env: {}, version: '2.115.0', childEnv: { HOME: root, CODEBUDDY_CONFIG_DIR: root },
+    statFn: () => ({ dev: 1, ino: 1, size: 100, mtimeMs: 1, ctimeMs: 1 }),
+    execFileFn: async () => {
+      if (timeout) throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })
+      return { stdout: '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits' }
+    },
+  }
+  const executable = '/test/config-file-workbuddy'
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'compatible')
+  timeout = true
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'compatible')
+  fs.writeFileSync(config, '{"changed":true}')
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'unknown')
+})
+
+test('capability probe cache follows native authentication files outside the config directory', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'meldwork-capability-auth-'))
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }))
+  const data = path.join(home, 'data')
+  const auth = path.join(data, 'opencode', 'auth.json')
+  fs.mkdirSync(path.dirname(auth), { recursive: true })
+  fs.writeFileSync(auth, '{}')
+  let timeout = false
+  const options = {
+    home, env: {}, version: '1.18.12', childEnv: { HOME: home, XDG_DATA_HOME: data },
+    statFn: () => ({ dev: 1, ino: 1, size: 100, mtimeMs: 1, ctimeMs: 1 }),
+    execFileFn: async () => {
+      if (timeout) throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })
+      return { stdout: '--format --agent --session --file json' }
+    },
+  }
+  const executable = '/test/auth-file-opencode'
+  assert.equal((await probeAgentCapabilities('opencode', executable, options)).compatibilityState, 'compatible')
+  timeout = true
+  assert.equal((await probeAgentCapabilities('opencode', executable, options)).compatibilityState, 'compatible')
+  fs.writeFileSync(auth, '{"changed":true}')
+  assert.equal((await probeAgentCapabilities('opencode', executable, options)).compatibilityState, 'unknown')
+})
+
+test('capability probe cache does not cross native configuration or credential environments', async () => {
+  let timeout = false
+  const options = {
+    env: {}, version: '2.115.0',
+    childEnv: { CODEBUDDY_CONFIG_DIR: '/native/one', CODEBUDDY_API_KEY: 'synthetic-one' },
+    statFn: () => ({ dev: 1, ino: 1, size: 100, mtimeMs: 1, ctimeMs: 1 }),
+    execFileFn: async () => {
+      if (timeout) throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })
+      return { stdout: '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits' }
+    },
+  }
+  const executable = '/test/config-sensitive-workbuddy'
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'compatible')
+  timeout = true
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'compatible')
+  options.childEnv = { ...options.childEnv, CODEBUDDY_CONFIG_DIR: '/native/two' }
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'unknown')
+  options.childEnv = { CODEBUDDY_CONFIG_DIR: '/native/one', CODEBUDDY_API_KEY: 'synthetic-two' }
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'unknown')
+})
+
+test('Windows capability cache follows the executable behind an npm shim', async () => {
+  const executable = 'C:\\test\\npm\\codebuddy.cmd'
+  let targetVersion = 1
+  let timeout = false
+  const options = {
+    platform: 'win32', home: 'C:\\Users\\Test', env: {}, version: '2.115.0',
+    readFileFn: () => '"%_prog%" "%dp0%\\node_modules\\codebuddy\\bin\\cli.js" %*',
+    existsFn: () => false,
+    statFn: filename => ({ dev: 1, ino: filename === executable ? 1 : targetVersion,
+      size: 100, mtimeMs: 1, ctimeMs: 1 }),
+    execFileFn: async () => {
+      if (timeout) throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })
+      return { stdout: '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits' }
+    },
+  }
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'compatible')
+  timeout = true
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'compatible')
+  targetVersion = 2
+  assert.equal((await probeAgentCapabilities('workbuddy', executable, options)).compatibilityState, 'unknown')
+})
+
+test('Agent detection does not promote an inconclusive capability check to compatible', async () => {
+  const [agent] = await detectAgents({
+    env: {},
+    resolveExecutableFn: async kind => kind === 'pi' ? '/test/cold-pi' : null,
+    execFileFn: async (_command, args) => {
+      if (args[0] === '--version') return { stdout: '0.84.2' }
+      throw Object.assign(new Error('timeout'), { killed: true })
+    },
+  })
+  assert.equal(agent.kind, 'pi')
+  assert.equal(agent.compatibilityState, 'unknown')
+  assert.equal(agent.incompatibilityReason, 'LOCAL_AGENT_CAPABILITY_PROBE_TIMEOUT')
+})
+
+test('Pi detection rejects same-name programs and CLIs missing required permission controls', async () => {
+  for (const [name, help, expected] of [
+    ['unrelated', 'Pi help: calculate digits of pi', 'incompatible'],
+    ['no-permission-controls', '--mode json --print --session --tools', 'incompatible'],
+    ['required-protocol', '--mode json --print --session --tools --approve --no-approve', 'compatible'],
+  ]) {
+    const [agent] = await detectAgents({
+      env: {},
+      resolveExecutableFn: async kind => kind === 'pi' ? `/test/pi-${name}/pi` : null,
+      execFileFn: async (_command, args) => ({ stdout: args[0] === '--version'
+        ? '0.84.2' : args.includes('--mode') ? argsForProbe(_command, args) : help }),
+    })
+    assert.equal(agent.kind, 'pi')
+    assert.equal(agent.compatibilityState, expected, name)
+    if (expected === 'incompatible') {
+      assert.equal(agent.incompatibilityReason, 'LOCAL_AGENT_REQUIRED_CAPABILITY_MISSING', name)
+    }
+  }
+})
+
+test('Pi detection rejects malformed JSON events even when help claims compatibility', async () => {
+  for (const output of [
+    'not JSON',
+    '{"type":"session","id":"missing-version"}',
+    '{"type":"message","version":3,"id":"wrong-event"}',
+  ]) {
+    const result = await probeAgentCapabilities('pi', '/test/pi', {
+      env: {},
+      execFileFn: async (_command, args) => ({ stdout: args.includes('--mode')
+        ? output : argsForProbe(_command, args) }),
+    })
+    assert.equal(result.compatibilityState, 'incompatible')
+    assert.equal(result.incompatibilityProbe, 'pi-json')
+  }
+})
+
+test('Pi protocol alone does not mark an unidentified version compatible', async () => {
+  const [agent] = await detectAgents({
+    env: {},
+    resolveExecutableFn: async kind => kind === 'pi' ? '/test/pi' : null,
+    execFileFn: async (command, args) => ({ stdout: args[0] === '--version'
+      ? 'unrelated program' : argsForProbe(command, args) }),
+  })
+  assert.equal(agent.compatibilityState, 'unknown')
+  assert.equal(agent.version, '')
+})
+
+test('Pi JSON probe closes stdin before waiting for a session event', { skip: process.platform === 'win32' }, async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'meldwork-pi-probe-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const launcher = executable(directory, 'pi', `
+if (process.argv.includes('--help')) {
+  console.log('--mode json --print --session --tools --approve --no-approve')
+} else {
+  process.stdin.resume()
+  process.stdin.on('end', () => console.log(JSON.stringify({ type: 'session', version: 3, id: 'fixture' })))
+}
+`)
+  const result = await within(probeAgentCapabilities('pi', launcher), 3000)
+  assert.equal(result.compatibilityState, 'compatible')
+})
+
+test('Agent discovery scans independent Agent kinds concurrently', async () => {
+  const started = []
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const detection = detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async (kind) => {
+      started.push(kind)
+      await gate
+      return null
+    },
+  })
+
+  await new Promise(resolve => setImmediate(resolve))
+  const startedBeforeRelease = started.length
+  release()
+  assert.deepEqual(await detection, [])
+  assert.equal(startedBeforeRelease, 14)
+})
+
+test('Hermes capability and ACP checks run concurrently without changing the result', async () => {
+  let active = 0
+  let maxActive = 0
+  const started = []
+  const found = await detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'hermes' ? '/tmp/hermes' : null,
+    execFileFn: async (_command, args) => {
+      if (args[0] === '--version') return { stdout: 'Hermes 0.19.1\n', stderr: '' }
+      started.push(args.join(' '))
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      await new Promise(resolve => setTimeout(resolve, 12))
+      active -= 1
+      if (args[0] === 'chat') {
+        return {
+          stdout: '--quiet --query --provider --model --resume --image --yolo',
+          stderr: '',
+        }
+      }
+      return { stdout: '', stderr: '' }
+    },
+  })
+
+  assert.equal(maxActive, 2)
+  assert.deepEqual(started.sort(), ['acp --check', 'chat --help'])
+  assert.equal(found[0].compatibilityState, 'compatible')
+  assert.equal(found[0].acpAvailable, true)
+})
+
+test('Agent version gates capability checks while keeping compatible probes parallel', async () => {
+  let releaseVersion
+  let releaseCapability
+  const versionGate = new Promise(resolve => { releaseVersion = resolve })
+  const capabilityGate = new Promise(resolve => { releaseCapability = resolve })
+  const started = []
+  const detection = detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'kimi' ? '/tmp/kimi' : null,
+    probeAgentCapabilitiesFn: async () => {
+      started.push('capability')
+      await capabilityGate
+      return {
+        compatibilityState: 'compatible',
+        incompatibilityReason: '',
+        incompatibilityProbe: '',
+      }
+    },
+    execFileFn: async (_command, args) => {
+      if (args[0] === '--version') {
+        started.push('version')
+        await versionGate
+        return { stdout: 'Kimi Code 0.19.2\n', stderr: '' }
+      }
+      throw new Error('unexpected probe')
+    },
+  })
+
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(started, ['version'])
+  releaseVersion()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(started, ['version', 'capability'])
+  releaseCapability()
+  const [found] = await detection
+  assert.equal(found.kind, 'kimi')
+  assert.equal(found.compatibilityState, 'compatible')
+})
+
+test('macOS Finder cold starts include common Node version manager paths', () => {
+  const roots = {
+    '/Users/Ryder/.nvm/versions/node': ['v20.12.0', 'v22.5.1'],
+    '/Users/Ryder/.local/share/fnm/node-versions': ['v21.1.0'],
+    '/Users/Ryder/Library/Application Support/fnm/node-versions': ['v22.4.0'],
+  }
+  const value = searchPath({
+    platform: 'darwin',
+    home: '/Users/Ryder',
+    env: {
+      PATH: '/usr/bin:/bin',
+      PNPM_HOME: '/Users/Ryder/Custom/pnpm',
+      FNM_MULTISHELL_PATH: '/Users/Ryder/Library/Application Support/fnm/session',
+      NVM_BIN: '/Users/Ryder/.nvm/versions/node/v23.0.0/bin',
+      BUN_INSTALL: '/Users/Ryder/.custom-bun',
+      ASDF_DATA_DIR: '/Users/Ryder/.custom-asdf',
+      MISE_DATA_DIR: '/Users/Ryder/.custom-mise',
+      NODENV_ROOT: '/Users/Ryder/.custom-nodenv',
+    },
+    readdirFn: root => (roots[root] || []).map(name => ({
+      name,
+      isDirectory: () => true,
+      isSymbolicLink: () => false,
+    })),
+  }).split(':')
+
+  assert.ok(value.includes('/Users/Ryder/.volta/bin'))
+  assert.ok(value.includes('/Users/Ryder/Custom/pnpm'))
+  assert.ok(value.includes('/Users/Ryder/Library/pnpm'))
+  assert.ok(value.includes('/Users/Ryder/.local/share/pnpm'))
+  assert.ok(value.includes('/Users/Ryder/.nvm/versions/node/v23.0.0/bin'))
+  assert.ok(value.includes('/Users/Ryder/.nvm/versions/node/v22.5.1/bin'))
+  assert.ok(value.includes('/Users/Ryder/.nvm/versions/node/v20.12.0/bin'))
+  assert.ok(value.indexOf('/Users/Ryder/.nvm/versions/node/v22.5.1/bin')
+    < value.indexOf('/Users/Ryder/.nvm/versions/node/v20.12.0/bin'))
+  assert.ok(value.includes('/Users/Ryder/Library/Application Support/fnm/session/bin'))
+  assert.ok(value.includes('/Users/Ryder/.local/share/fnm/aliases/default/bin'))
+  assert.ok(value.includes('/Users/Ryder/.local/share/fnm/node-versions/v21.1.0/installation/bin'))
+  assert.ok(value.includes('/Users/Ryder/Library/Application Support/fnm/node-versions/v22.4.0/installation/bin'))
+  assert.ok(value.includes('/Users/Ryder/.asdf/shims'))
+  assert.ok(value.includes('/Users/Ryder/.custom-asdf/shims'))
+  assert.ok(value.includes('/Users/Ryder/.local/share/mise/shims'))
+  assert.ok(value.includes('/Users/Ryder/.custom-mise/shims'))
+  assert.ok(value.includes('/Users/Ryder/.nodenv/shims'))
+  assert.ok(value.includes('/Users/Ryder/.custom-nodenv/shims'))
+  assert.ok(value.includes('/Users/Ryder/.bun/bin'))
+  assert.ok(value.includes('/Users/Ryder/.custom-bun/bin'))
+})
+
+test('Windows search path includes npm, app, and user CLI locations', () => {
+  const value = searchPath({
+    platform: 'win32',
+    home: 'C:\\Users\\Ryder',
+    env: {
+      Path: 'C:\\Tools;C:\\Windows\\System32',
+      APPDATA: 'C:\\Users\\Ryder\\AppData\\Roaming',
+      LOCALAPPDATA: 'C:\\Users\\Ryder\\AppData\\Local',
+      PNPM_HOME: 'D:\\Tools\\pnpm',
+      NVM_HOME: 'D:\\Tools\\nvm',
+      NVM_SYMLINK: 'D:\\Tools\\nodejs',
+      ProgramFiles: 'C:\\Program Files',
+      ProgramData: 'C:\\ProgramData',
+    },
+  }).split(';')
+
+  assert.ok(value.includes('C:\\Users\\Ryder\\AppData\\Roaming\\npm'))
+  assert.ok(value.includes('D:\\Tools\\pnpm'))
+  assert.ok(value.includes('C:\\Users\\Ryder\\AppData\\Local\\pnpm'))
+  assert.ok(value.includes('C:\\Users\\Ryder\\AppData\\Local\\Microsoft\\WindowsApps'))
+  assert.ok(value.includes('C:\\Users\\Ryder\\AppData\\Local\\Programs\\WorkBuddy\\resources\\app.asar.unpacked\\cli\\bin'))
+  assert.ok(value.includes('C:\\Users\\Ryder\\.kimi-code\\bin'))
+  assert.ok(value.includes('D:\\Tools\\nvm'))
+  assert.ok(value.includes('D:\\Tools\\nodejs'))
+  assert.ok(value.includes('C:\\Program Files\\nodejs'))
+  assert.ok(value.includes('C:\\ProgramData\\chocolatey\\bin'))
+})
+
+test('native environment names are case sensitive on Unix and case insensitive on Windows', async () => {
+  const { systemChildEnvironment } = require('../../../src/agents/cli/cli-discovery.cjs')
+  assert.notEqual(systemChildEnvironment({ home: '/tmp/not-home' }, 'darwin').HOME, '/tmp/not-home')
+  assert.equal(systemChildEnvironment({ userprofile: 'C:\\Native' }, 'win32').USERPROFILE, 'C:\\Native')
+  const unixPath = searchPath({ platform: 'darwin', home: '/tmp/user',
+    env: { path: '/tmp/not-native', pnpm_home: '/tmp/not-pnpm' } }).split(':')
+  assert.equal(unixPath.includes('/tmp/not-native'), false)
+  assert.equal(unixPath.includes('/tmp/not-pnpm'), false)
+  const windowsPath = searchPath({ platform: 'win32', home: 'C:\\Users\\Ryder',
+    env: { Path: 'C:\\Native', pnpm_home: 'C:\\Pnpm' } }).split(';')
+  assert.ok(windowsPath.includes('C:\\Native'))
+  assert.ok(windowsPath.includes('C:\\Pnpm'))
+  for (const platform of ['darwin', 'win32']) {
+    let versionEnvironment
+    await detectAgents({
+      platform, env: { hermes_home: '/tmp/not-native' },
+      resolveExecutableFn: async kind => kind === 'hermes' ? '/tmp/hermes' : null,
+      probeAgentCapabilitiesFn: async () => ({ compatibilityState: 'compatible' }),
+      execFileFn: async (_command, args, options) => {
+        if (args.includes('--version')) versionEnvironment = options.env
+        return { stdout: 'Hermes 0.19.1', stderr: '' }
+      },
+    })
+    assert.equal(versionEnvironment.HERMES_HOME, platform === 'win32' ? '/tmp/not-native' : undefined)
+  }
+})
+
+test('Hermes discovery falls back to the native installation when the PATH launcher is missing', async () => {
+  const home = '/test/hermes-home'
+  const expected = path.join(home, '.hermes', 'hermes-agent', '.hermes', 'bin', 'hermes')
+  const executable = await resolveExecutable('hermes', {
+    platform: 'darwin', home, env: { PATH: '/missing' },
+    accessFn: async candidate => { if (candidate !== expected) throw new Error('missing') },
+    execFileFn: async () => { throw new Error('missing') },
+  })
+  assert.equal(executable, expected)
+})
+
+test('Hermes discovery honors an explicit installation directory after PATH', async () => {
+  const expected = '/test/custom-install/.hermes/bin/hermes'
+  const options = { platform: 'darwin', home: '/test/home',
+    env: { PATH: '/test/bin', HERMES_INSTALL_DIR: '/test/custom-install' },
+    accessFn: async candidate => { if (candidate !== expected) throw new Error('missing') },
+    execFileFn: async () => { throw new Error('missing') } }
+  assert.equal(await resolveExecutable('hermes', options), expected)
+  options.accessFn = async candidate => {
+    if (!['/test/bin/hermes', expected].includes(candidate)) throw new Error('missing')
+  }
+  assert.equal(await resolveExecutable('hermes', options), '/test/bin/hermes')
+})
+
+test('Hermes discovers a flat installation in the selected native home', async () => {
+  const selected = '/test/flat-hermes'
+  const expected = `${selected}/.hermes/bin/hermes`
+  const options = { platform: 'darwin', home: '/test/home',
+    env: { PATH: '/missing', HERMES_HOME: selected },
+    accessFn: async candidate => { if (candidate !== expected) throw new Error('missing') },
+    execFileFn: async () => { throw new Error('missing') } }
+  assert.equal(await resolveExecutable('hermes', options), expected)
+  const agents = await detectAgents({ ...options,
+    nativeEnvironmentForKind: kind => kind === 'hermes' ? { HERMES_HOME: selected } : {},
+    execFileFn: async (_command, args) => args[0] === '--version'
+      ? { stdout: 'Hermes 0.19.1', stderr: '' } : { stdout: '', stderr: '' },
+    probeAgentCapabilitiesFn: async () => ({ compatibilityState: 'compatible' }),
+  })
+  assert.equal(agents.find(agent => agent.kind === 'hermes')?.executable, expected)
+  const legacy = `${selected}/venv/bin/hermes`
+  options.accessFn = async candidate => { if (candidate !== legacy) throw new Error('missing') }
+  options.statFn = async () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }) }
+  assert.equal(await resolveExecutable('hermes', options), legacy)
+  options.statFn = async () => ({ isDirectory: () => true })
+  assert.equal(await resolveExecutable('hermes', options), null)
+})
+
+test('Hermes discovers a legacy Unix virtual environment only for legacy installs', async () => {
+  const legacy = '/test/custom-install/venv/bin/hermes'
+  const options = { platform: 'darwin', home: '/test/home',
+    env: { PATH: '/missing', HERMES_INSTALL_DIR: '/test/custom-install' },
+    accessFn: async candidate => { if (candidate !== legacy) throw new Error('missing') },
+    execFileFn: async () => { throw new Error('missing') },
+    statFn: async () => { const error = new Error('missing'); error.code = 'ENOENT'; throw error },
+  }
+  for (const platform of ['darwin', 'linux']) {
+    assert.equal(await resolveExecutable('hermes', { ...options, platform }), legacy)
+  }
+  options.statFn = async () => ({ isDirectory: () => true })
+  assert.equal(await resolveExecutable('hermes', options), null)
+  options.statFn = async () => { const error = new Error('denied'); error.code = 'EACCES'; throw error }
+  assert.equal(await resolveExecutable('hermes', options), null)
+})
+
+test('Hermes detection uses the selected native home when locating its installation', async () => {
+  const expected = '/test/selected/hermes-agent/.hermes/bin/hermes'
+  const agents = await detectAgents({ platform: 'darwin', home: '/test/home', env: { PATH: '/missing' },
+    nativeEnvironmentForKind: kind => kind === 'hermes' ? { HERMES_HOME: '/test/selected' } : {},
+    accessFn: async candidate => { if (candidate !== expected) throw new Error('missing') },
+    execFileFn: async (_command, args) => args[0] === '--version'
+      ? { stdout: 'Hermes 0.19.1', stderr: '' } : { stdout: '', stderr: '' },
+    probeAgentCapabilitiesFn: async () => ({ compatibilityState: 'compatible' }),
+  })
+  assert.equal(agents.find(agent => agent.kind === 'hermes')?.executable, expected)
+})
+
+test('Hermes discovery expands the native home shorthand', async () => {
+  const expected = '/test/home/profiles/work/hermes-agent/.hermes/bin/hermes'
+  const executable = await resolveExecutable('hermes', {
+    platform: 'linux', home: '/test/home', env: { PATH: '/missing', HERMES_HOME: '~/profiles/work' },
+    accessFn: async candidate => { if (candidate !== expected) throw new Error('missing') },
+    execFileFn: async () => { throw new Error('missing') },
+  })
+  assert.equal(executable, expected)
+})
+
+test('Windows Hermes discovery falls back to its native launcher and legacy virtual environment', async () => {
+  const home = 'C:\\Users\\Ryder'
+  const root = 'C:\\Native Hermes'
+  const launcher = 'C:\\Native Hermes\\bin\\hermes.EXE'
+  const legacy = 'C:\\Native Hermes\\hermes-agent\\venv\\Scripts\\hermes.EXE'
+  const options = { platform: 'win32', home, env: { PATH: 'C:\\missing', HERMES_HOME: root, PATHEXT: '.EXE;.CMD' },
+    accessFn: async candidate => { if (candidate !== launcher) throw new Error('missing') },
+    execFileFn: async () => { throw new Error('missing') } }
+  assert.equal(await resolveExecutable('hermes', options), launcher)
+  options.accessFn = async candidate => { if (candidate !== legacy) throw new Error('missing') }
+  assert.equal(await resolveExecutable('hermes', options), legacy)
+  const flat = 'C:\\Native Hermes\\venv\\Scripts\\hermes.EXE'
+  options.accessFn = async candidate => { if (candidate !== flat) throw new Error('missing') }
+  assert.equal(await resolveExecutable('hermes', options), flat)
+  options.accessFn = async candidate => { if (candidate !== 'C:\\missing\\hermes.EXE') throw new Error('missing') }
+  assert.equal(await resolveExecutable('hermes', options), 'C:\\missing\\hermes.EXE')
+  options.env = { PATH: 'C:\\missing', LOCALAPPDATA: 'C:\\Users\\Ryder\\AppData\\Local', PATHEXT: '.EXE' }
+  const defaultLauncher = 'C:\\Users\\Ryder\\AppData\\Local\\hermes\\bin\\hermes.EXE'
+  options.accessFn = async candidate => { if (candidate !== defaultLauncher) throw new Error('missing') }
+  assert.equal(await resolveExecutable('hermes', options), defaultLauncher)
+})
+
+test('Windows executable resolution honors PATHEXT', async () => {
+  const expected = 'C:\\Tools\\codex.CMD'
+  const executable = await resolveExecutable('codex', {
+    platform: 'win32',
+    home: 'C:\\Users\\Ryder',
+    env: {
+      Path: 'C:\\Tools',
+      PATHEXT: '.EXE;.CMD',
+    },
+    accessFn: async (candidate) => {
+      if (candidate !== expected) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+    execFileFn: async () => {
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+  })
+
+  assert.equal(executable, expected)
+})
+
+test('Windows executable resolution falls back to where.exe', async () => {
+  const expected = 'D:\\Agent Tools\\qwen.cmd'
+  const executable = await resolveExecutable('qwen', {
+    platform: 'win32',
+    home: 'C:\\Users\\Ryder',
+    env: {
+      Path: 'C:\\Windows\\System32',
+      PATHEXT: '.EXE;.CMD',
+    },
+    accessFn: async (candidate) => {
+      if (candidate !== expected) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+    execFileFn: async (command, args) => {
+      assert.equal(command, 'where.exe')
+      assert.deepEqual(args, ['qwen'])
+      return { stdout: `${expected}\r\n`, stderr: '' }
+    },
+  })
+
+  assert.equal(executable, expected)
+})
+
+test('Linux executable resolution uses an allowlisted environment in the fallback shell', async () => {
+  const expected = '/opt/agents/kimi'
+  const executable = await resolveExecutable('kimi', {
+    platform: 'linux',
+    home: '/home/ryder',
+    env: {
+      HOME: '/home/ryder',
+      LANG: 'zh_CN.UTF-8',
+      PATH: '/usr/bin:/bin',
+      MELDWORK_PRIVATE_VALUE: 'desktop-private-value',
+      OPENAI_API_KEY: 'provider-secret',
+    },
+    accessFn: async (candidate) => {
+      if (candidate !== expected) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+    execFileFn: async (command, args, options) => {
+      assert.equal(command, '/bin/sh')
+      assert.deepEqual(args, ['-lc', 'command -v -- kimi'])
+      assert.equal(options.env.HOME, '/home/ryder')
+      assert.equal(options.env.LANG, 'zh_CN.UTF-8')
+      assert.match(options.env.PATH, /\/usr\/bin:\/bin/)
+      assert.equal(options.env.MELDWORK_PRIVATE_VALUE, undefined)
+      assert.equal(options.env.OPENAI_API_KEY, undefined)
+      return { stdout: `${expected}\n`, stderr: '' }
+    },
+  })
+
+  assert.equal(executable, expected)
+})
+
+test('macOS WorkBuddy detection keeps the application-bundled CLI path', async () => {
+  const expected = '/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy'
+  const executable = await resolveExecutable('workbuddy', {
+    platform: 'darwin',
+    home: '/Users/ryder',
+    env: { PATH: '' },
+    accessFn: async (candidate) => {
+      if (candidate !== expected) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+    execFileFn: async () => {
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+  })
+
+  assert.equal(executable, expected)
+})
+
+test('macOS WorkBuddy detection also checks the per-user Applications folder', async () => {
+  const expected = '/Users/ryder/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy'
+  const executable = await resolveExecutable('workbuddy', {
+    platform: 'darwin',
+    home: '/Users/ryder',
+    env: { PATH: '' },
+    accessFn: async (candidate) => {
+      if (candidate !== expected) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+    execFileFn: async () => {
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+  })
+
+  assert.equal(executable, expected)
+})
+
+test('macOS Codex detection keeps the ChatGPT application-bundled CLI path', async () => {
+  const expected = '/Applications/ChatGPT.app/Contents/Resources/codex'
+  const executable = await resolveExecutable('codex', {
+    platform: 'darwin',
+    home: '/Users/ryder',
+    env: { PATH: '' },
+    accessFn: async (candidate) => {
+      if (candidate !== expected) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+    execFileFn: async () => {
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+  })
+
+  assert.equal(executable, expected)
+})
+
+test('macOS Codex detection also checks the per-user ChatGPT application', async () => {
+  const expected = '/Users/ryder/Applications/ChatGPT.app/Contents/Resources/codex'
+  const executable = await resolveExecutable('codex', {
+    platform: 'darwin',
+    home: '/Users/ryder',
+    env: { PATH: '' },
+    accessFn: async (candidate) => {
+      if (candidate !== expected) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+    execFileFn: async () => {
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+  })
+
+  assert.equal(executable, expected)
+})
+
+test('WorkBuddy detection does not mistake the generic cbc solver for WorkBuddy', async () => {
+  const probed = []
+  const lookups = []
+  const executable = await resolveExecutable('workbuddy', {
+    platform: 'darwin',
+    home: '/Users/Ryder',
+    env: { PATH: '/tools' },
+    accessFn: async (candidate) => {
+      probed.push(candidate)
+      if (candidate === '/tools/cbc') return
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+    execFileFn: async (_command, args) => {
+      lookups.push(args.at(-1))
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+  })
+
+  assert.equal(executable, null)
+  assert.equal(probed.includes('/tools/cbc'), false)
+  assert.equal(lookups.some(value => value.includes('cbc')), false)
+})
+
+test('Windows npm command shims launch Node directly without reparsing prompt text', () => {
+  const executable = 'C:\\Users\\Ryder\\AppData\\Roaming\\npm\\codex.cmd'
+  const prompt = 'compare A & B, then echo %PATH% and !tokens!'
+  const shim = [
+    '@ECHO off',
+    'SETLOCAL',
+    'IF EXIST "%dp0%\\node.exe" (',
+    '  SET "_prog=%dp0%\\node.exe"',
+    ') ELSE (',
+    '  SET "_prog=node"',
+    ')',
+    '"%_prog%" "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*',
+  ].join('\r\n')
+
+  const spec = prepareCommand(executable, [prompt], {
+    platform: 'win32',
+    env: {},
+    readFileFn: () => shim,
+    existsFn: () => false,
+  })
+
+  assert.equal(spec.command, 'node.exe')
+  assert.deepEqual(spec.args, [
+    'C:\\Users\\Ryder\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js',
+    prompt,
+  ])
+})
+
+test('Windows WorkBuddy npm shims accept an extensionless node_modules target', () => {
+  const executable = 'C:\\Users\\Ryder\\AppData\\Roaming\\npm\\codebuddy.cmd'
+  const shim = [
+    '@ECHO off',
+    '"%dp0%\\node_modules\\@tencent-ai\\codebuddy-code\\bin\\codebuddy" %*',
+  ].join('\r\n')
+
+  const spec = prepareCommand(executable, ['hello'], {
+    platform: 'win32',
+    env: {},
+    readFileFn: () => shim,
+    existsFn: () => false,
+  })
+
+  assert.equal(spec.command, 'node.exe')
+  assert.deepEqual(spec.args, [
+    'C:\\Users\\Ryder\\AppData\\Roaming\\npm\\node_modules\\@tencent-ai\\codebuddy-code\\bin\\codebuddy',
+    'hello',
+  ])
+})
+
+test('Windows OpenCode npm shims launch the packaged native executable directly', () => {
+  const executable = 'C:\\Users\\Ryder\\AppData\\Roaming\\npm\\opencode.cmd'
+  const native = 'C:\\Users\\Ryder\\AppData\\Roaming\\npm\\node_modules\\opencode-ai\\bin\\opencode.exe'
+  const shim = [
+    '@ECHO off',
+    '"%dp0%\\node_modules\\opencode-ai\\bin\\opencode.exe" %*',
+  ].join('\r\n')
+
+  const spec = prepareCommand(executable, ['run', '--format', 'json'], {
+    platform: 'win32',
+    env: {},
+    readFileFn: () => shim,
+    existsFn: filename => filename === native,
+  })
+
+  assert.equal(spec.command, native)
+  assert.deepEqual(spec.args, ['run', '--format', 'json'])
+})
+
+test('Windows extensionless npm shims reject traversal and non-node_modules targets', () => {
+  const executable = 'C:\\Users\\Ryder\\AppData\\Roaming\\npm\\codebuddy.cmd'
+  const options = {
+    platform: 'win32',
+    env: {},
+    existsFn: () => false,
+  }
+
+  assert.throws(
+    () => prepareCommand(executable, [], {
+      ...options,
+      readFileFn: () => '"%dp0%\\..\\outside\\node_modules\\codebuddy" %*',
+    }),
+    { message: 'LOCAL_CLI_WRAPPER_UNSUPPORTED' },
+  )
+  assert.throws(
+    () => prepareCommand(executable, [], {
+      ...options,
+      readFileFn: () => '"%dp0%\\bin\\codebuddy" %*',
+    }),
+    { message: 'LOCAL_CLI_WRAPPER_UNSUPPORTED' },
+  )
+})
+
+test('Windows Agent detection reads versions through the portable command launcher', async () => {
+  const executable = 'C:\\Users\\Ryder\\AppData\\Roaming\\npm\\claude.cmd'
+  const calls = []
+  const found = await detectAgents({
+    platform: 'win32',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'claude' ? executable : null,
+    prepareCommandFn: (command, args) => ({ command: 'node.exe', args: ['claude.js', ...args] }),
+    execFileFn: async (command, args) => {
+      calls.push({ command, args })
+      return args.includes('--version')
+        ? { stdout: '2.1.165\r\nbuild metadata\r\n', stderr: '' }
+        : {
+            stdout: [
+              '--print', '--output-format', '--include-partial-messages', '--verbose',
+              '--permission-mode', '--resume', 'stream-json', 'plan', 'acceptEdits',
+            ].join(' '),
+            stderr: '',
+          }
+    },
+  })
+
+  assert.deepEqual(calls, [
+    { command: 'node.exe', args: ['claude.js', '--version'] },
+    { command: 'node.exe', args: ['claude.js', '--help'] },
+  ])
+  assert.deepEqual(found, [{
+    kind: 'claude',
+    name: 'Claude CLI',
+    executable,
+    version: '2.1.165',
+    resolvedVersion: '2.1.165',
+    supportedVersionRange: '2.1.165..2.1.221',
+    compatibilityState: 'compatible',
+    incompatibilityReason: '',
+    incompatibilityProbe: '',
+  }])
+})
+
+test('Hermes detection records ACP availability when the capability check succeeds', async () => {
+  const calls = []
+  const found = await detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'hermes' ? '/tmp/hermes' : null,
+    execFileFn: async (_command, args) => {
+      calls.push(args)
+      if (args[0] === '--version') return { stdout: 'Hermes 0.19.1\n', stderr: '' }
+      if (args[0] === 'chat') {
+        return {
+          stdout: [
+            '--quiet', '--query', '--provider', '--model', '--resume',
+            '--image', '--yolo',
+          ].join(' '),
+          stderr: '',
+        }
+      }
+      assert.deepEqual(args, ['acp', '--check'])
+      return { stdout: '', stderr: '' }
+    },
+  })
+
+  assert.deepEqual(calls.map(args => args.join(' ')).sort(), [
+    '--version', 'acp --check', 'chat --help',
+  ])
+  assert.deepEqual(found, [{
+    kind: 'hermes',
+    name: 'Hermes CLI',
+    executable: '/tmp/hermes',
+    version: 'Hermes 0.19.1',
+    resolvedVersion: '0.19.1',
+    supportedVersionRange: '0.19.1..0.20.0',
+    compatibilityState: 'compatible',
+    incompatibilityReason: '',
+    incompatibilityProbe: '',
+    acpAvailable: true,
+  }])
+})
+
+test('Hermes detection records unavailable ACP when the capability check fails', async () => {
+  const calls = []
+  const found = await detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'hermes' ? '/tmp/hermes' : null,
+    execFileFn: async (_command, args) => {
+      calls.push(args)
+      if (args[0] === '--version') return { stdout: 'Hermes 0.19.1\n', stderr: '' }
+      if (args[0] === 'chat') {
+        return {
+          stdout: [
+            '--quiet', '--query', '--provider', '--model', '--resume',
+            '--image', '--yolo',
+          ].join(' '),
+          stderr: '',
+        }
+      }
+      assert.deepEqual(args, ['acp', '--check'])
+      throw new Error('ACP unavailable')
+    },
+  })
+
+  assert.deepEqual(calls.map(args => args.join(' ')).sort(), [
+    '--version', 'acp --check', 'chat --help',
+  ])
+  assert.deepEqual(found, [{
+    kind: 'hermes',
+    name: 'Hermes CLI',
+    executable: '/tmp/hermes',
+    version: 'Hermes 0.19.1',
+    resolvedVersion: '0.19.1',
+    supportedVersionRange: '0.19.1..0.20.0',
+    compatibilityState: 'compatible',
+    incompatibilityReason: '',
+    incompatibilityProbe: '',
+    acpAvailable: false,
+  }])
+})
+
+test('Agent detection ignores ANSI warnings with unrelated versions before the product version', async () => {
+  const found = await detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'kimi' ? '/tmp/kimi' : null,
+    probeAgentCapabilitiesFn: async () => ({
+      compatibilityState: 'compatible',
+      incompatibilityReason: '',
+      incompatibilityProbe: '',
+    }),
+    execFileFn: async () => ({
+      stdout: '\u001b[33mWarning: Node.js 22.5.1 is experimental\u001b[0m\n',
+      stderr: '\u001b[32mKimi Code 0.19.2\u001b[0m\n',
+    }),
+  })
+
+  assert.deepEqual(found, [{
+    kind: 'kimi',
+    name: 'Kimi CLI',
+    executable: '/tmp/kimi',
+    version: 'Kimi Code 0.19.2',
+    resolvedVersion: '0.19.2',
+    supportedVersionRange: '0.19.2..0.32.0',
+    compatibilityState: 'compatible',
+    incompatibilityReason: '',
+    incompatibilityProbe: '',
+  }])
+})
+
+test('Agent detection does not identify a runtime version mentioned after its product name', async () => {
+  let probes = 0
+  const found = await detectAgents({
+    platform: 'darwin', env: {},
+    resolveExecutableFn: async kind => kind === 'kimi' ? '/tmp/kimi' : null,
+    probeAgentCapabilitiesFn: async () => { probes += 1; return { compatibilityState: 'compatible' } },
+    execFileFn: async () => ({ stdout: 'Warning: Kimi Code requires Node.js 22.5.1\n', stderr: '' }),
+  })
+  assert.equal(probes, 1)
+  assert.equal(found[0].versionIdentified, false)
+  assert.equal(found[0].resolvedVersion, '')
+  assert.equal(found[0].compatibilityState, 'compatible')
+})
+
+test('Agent detection forwards the identified product version when another version precedes it on the same line', async () => {
+  const found = await detectAgents({
+    platform: 'darwin', env: {},
+    resolveExecutableFn: async kind => kind === 'kimi' ? '/tmp/kimi' : null,
+    probeAgentCapabilitiesFn: async () => ({ compatibilityState: 'compatible' }),
+    execFileFn: async () => ({
+      stdout: 'Warning: Node.js 22.5.1 could not initialize Kimi Code 0.19.2', stderr: '',
+    }),
+  })
+  assert.equal(found[0].version, '0.19.2')
+  assert.equal(found[0].resolvedVersion, '0.19.2')
+  assert.equal(require('../../../src/agents/connectors/agent-connector-local.cjs').semanticVersionFrom(found[0].version), '0.19.2')
+  assert.equal(found[0].compatibilityState, 'compatible')
+})
+
+test('Agent detection accepts newer versions when required capabilities are available', async () => {
+  let calls = 0
+  const found = await detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'codex' ? '/tmp/codex' : null,
+    execFileFn: async (_command, args) => {
+      calls += 1
+      if (args[0] === '--version') return { stdout: 'codex-cli 0.147.0\n', stderr: '' }
+      if (args.includes('resume')) {
+        return { stdout: '--json --skip-git-repo-check', stderr: '' }
+      }
+      return {
+        stdout: '--json --sandbox --skip-git-repo-check --image read-only workspace-write',
+        stderr: '',
+      }
+    },
+  })
+
+  assert.equal(calls, 3)
+  assert.deepEqual(found, [{
+    kind: 'codex',
+    name: 'Codex CLI',
+    executable: '/tmp/codex',
+    version: 'codex-cli 0.147.0',
+    resolvedVersion: '0.147.0',
+    supportedVersionRange: '0.137.0..0.146.0',
+    compatibilityState: 'compatible',
+    incompatibilityReason: '',
+    incompatibilityProbe: '',
+  }])
+})
+
+test('Agent detection accepts the validated ChatGPT-bundled Codex prerelease', async () => {
+  let calls = 0
+  const found = await detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'codex' ? '/tmp/codex' : null,
+    execFileFn: async (_command, args) => {
+      calls += 1
+      if (args[0] === '--version') {
+        return { stdout: 'codex-cli 0.146.0-alpha.9.2\n', stderr: '' }
+      }
+      if (args.includes('resume')) {
+        return { stdout: '--json --skip-git-repo-check', stderr: '' }
+      }
+      return {
+        stdout: '--json --sandbox --skip-git-repo-check --image read-only workspace-write',
+        stderr: '',
+      }
+    },
+  })
+
+  assert.equal(calls, 3)
+  assert.equal(found[0].resolvedVersion, '0.146.0-alpha.9.2')
+  assert.equal(found[0].compatibilityState, 'compatible')
+  assert.equal(found[0].incompatibilityReason, '')
+})
+
+test('Agent detection keeps the first newer Codex when its capabilities are compatible', async () => {
+  const unsupported = '/tools/codex'
+  const bundled = '/Applications/ChatGPT.app/Contents/Resources/codex'
+  const found = await detectAgents({
+    platform: 'darwin',
+    home: '/Users/ryder',
+    env: { PATH: '/tools' },
+    accessFn: async (candidate) => {
+      if (![unsupported, bundled].includes(candidate)) {
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+      }
+    },
+    execFileFn: async (command, args) => {
+      if (args[0] === '--version') {
+        return {
+          stdout: command === unsupported
+            ? 'codex-cli 0.147.0\n'
+            : 'codex-cli 0.146.0-alpha.9.2\n',
+          stderr: '',
+        }
+      }
+      if (args.includes('resume')) {
+        return { stdout: '--json --skip-git-repo-check', stderr: '' }
+      }
+      return {
+        stdout: '--json --sandbox --skip-git-repo-check --image read-only workspace-write',
+        stderr: '',
+      }
+    },
+  })
+
+  assert.equal(found.length, 1)
+  assert.equal(found[0].executable, unsupported)
+  assert.equal(found[0].resolvedVersion, '0.147.0')
+  assert.equal(found[0].compatibilityState, 'compatible')
+})
+
+test('Agent detection skips a capability-incompatible Codex before the compatible bundle', async () => {
+  const incomplete = '/tools/codex'
+  const bundled = '/Applications/ChatGPT.app/Contents/Resources/codex'
+  const found = await detectAgents({
+    platform: 'darwin',
+    home: '/Users/ryder',
+    env: { PATH: '/tools' },
+    accessFn: async (candidate) => {
+      if (![incomplete, bundled].includes(candidate)) {
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+      }
+    },
+    execFileFn: async (command, args) => {
+      if (args[0] === '--version') {
+        return { stdout: 'codex-cli 0.146.0\n', stderr: '' }
+      }
+      if (command === incomplete) return { stdout: '--json', stderr: '' }
+      if (args.includes('resume')) {
+        return { stdout: '--json --skip-git-repo-check', stderr: '' }
+      }
+      return {
+        stdout: '--json --sandbox --skip-git-repo-check --image read-only workspace-write',
+        stderr: '',
+      }
+    },
+  })
+
+  assert.equal(found.length, 1)
+  assert.equal(found[0].executable, bundled)
+  assert.equal(found[0].resolvedVersion, '0.146.0')
+  assert.equal(found[0].compatibilityState, 'compatible')
+})
+
+test('Agent detection skips an unidentified Codex before an identified compatible bundle', async () => {
+  const first = '/tools/codex'
+  const bundled = '/Applications/ChatGPT.app/Contents/Resources/codex'
+  const found = await detectAgents({
+    platform: 'darwin', home: '/Users/ryder', env: { PATH: '/tools' },
+    accessFn: async candidate => {
+      if (![first, bundled].includes(candidate)) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+    },
+    execFileFn: async (command, args) => {
+      if (args[0] === '--version') return { stdout: command === first ? 'unknown version' : 'codex-cli 0.146.0', stderr: '' }
+      if (args.includes('resume')) return { stdout: '--json --skip-git-repo-check', stderr: '' }
+      return { stdout: '--json --sandbox --skip-git-repo-check --image read-only workspace-write', stderr: '' }
+    },
+  })
+  assert.equal(found.length, 1)
+  assert.equal(found[0].executable, bundled)
+  assert.equal(found[0].resolvedVersion, '0.146.0')
+})
+
+test('Agent detection retains the first capability-incompatible Codex when no candidate works', async () => {
+  const first = '/tools/codex'
+  const bundled = '/Applications/ChatGPT.app/Contents/Resources/codex'
+  const found = await detectAgents({
+    platform: 'darwin',
+    home: '/Users/ryder',
+    env: { PATH: '/tools' },
+    accessFn: async (candidate) => {
+      if (![first, bundled].includes(candidate)) {
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+      }
+    },
+    execFileFn: async (command, args) => {
+      if (args[0] !== '--version') throw new Error('unexpected capability probe')
+      return {
+        stdout: command === first
+          ? 'codex-cli 0.147.0\n'
+          : 'codex-cli 0.146.0-alpha.9.3\n',
+        stderr: '',
+      }
+    },
+  })
+
+  assert.equal(found.length, 1)
+  assert.equal(found[0].executable, first)
+  assert.equal(found[0].resolvedVersion, '0.147.0')
+  assert.equal(found[0].compatibilityState, 'incompatible')
+  assert.equal(found[0].incompatibilityReason, 'LOCAL_AGENT_REQUIRED_CAPABILITY_MISSING')
+  assert.equal(found[0].incompatibilityProbe, 'codex-exec')
+})
+
+test('Agent detection records the required capability or protocol that is unavailable', async () => {
+  const codex = await detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'codex' ? '/tmp/codex' : null,
+    execFileFn: async (_command, args) => args[0] === '--version'
+      ? { stdout: '0.137.0\n', stderr: '' }
+      : { stdout: '--json --sandbox --skip-git-repo-check', stderr: '' },
+  })
+  assert.equal(codex[0].compatibilityState, 'incompatible')
+  assert.equal(codex[0].incompatibilityReason, 'LOCAL_AGENT_REQUIRED_CAPABILITY_MISSING')
+  assert.equal(codex[0].incompatibilityProbe, 'codex-exec')
+
+  const kimi = await detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'kimi' ? '/tmp/kimi' : null,
+    execFileFn: async (_command, args) => {
+      if (args[0] === '--version') return { stdout: '0.19.2\n', stderr: '' }
+      if (args[0] === '--help') {
+        return {
+          stdout: '--output-format --auto --session --prompt stream-json',
+          stderr: '',
+        }
+      }
+      throw new Error('ACP unavailable')
+    },
+  })
+  assert.equal(kimi[0].compatibilityState, 'incompatible')
+  assert.equal(kimi[0].incompatibilityReason, 'LOCAL_AGENT_PROTOCOL_UNAVAILABLE')
+  assert.equal(kimi[0].incompatibilityProbe, 'kimi-acp')
+})
+
+test('Agent detection probes capabilities when the product version is unrecognized', async () => {
+  let calls = 0
+  const found = await detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'kimi' ? '/tmp/kimi' : null,
+    execFileFn: async () => {
+      calls += 1
+      return { stdout: 'Please log in first\n', stderr: '' }
+    },
+  })
+
+  assert.equal(calls, 3)
+  assert.deepEqual(found, [{
+    kind: 'kimi',
+    name: 'Kimi CLI',
+    executable: '/tmp/kimi',
+    version: '',
+    versionIdentified: false,
+    resolvedVersion: '',
+    supportedVersionRange: '0.19.2..0.32.0',
+    compatibilityState: 'unknown',
+    incompatibilityReason: 'LOCAL_AGENT_AUTH_REQUIRED',
+    incompatibilityProbe: 'kimi-stream',
+  }])
+})
+
+test('Agent detection reads product versions from nonzero version-command output', async () => {
+  for (const [output, expected, code] of [
+    ['Node.js 22.0.0 warning\nKimi Code 0.29.0', '0.29.0', 1],
+    ['Node.js 22.0.0 warning', '', 1],
+    ['Kimi Code 0.29.0', '', 'ETIMEDOUT'],
+  ]) {
+    const found = await detectAgents({
+      platform: 'darwin', env: {},
+      resolveExecutableFn: async kind => kind === 'kimi' ? '/tmp/kimi' : null,
+      execFileFn: async () => { throw Object.assign(new Error('version command failed'), { code, stderr: output }) },
+      probeAgentCapabilitiesFn: async () => ({ compatibilityState: 'compatible', incompatibilityReason: '', incompatibilityProbe: '' }),
+    })
+    assert.equal(found[0].resolvedVersion, expected)
+    assert.equal(found[0].versionIdentified !== false, Boolean(expected))
+  }
+})
+
+test('authentication errors in capability probes do not imply protocol incompatibility', async () => {
+  const result = await probeAgentCapabilities('workbuddy', '/test/auth-workbuddy', {
+    env: {},
+    execFileFn: async () => { throw Object.assign(new Error('Please log in first'), { code: 1 }) },
+  })
+  assert.equal(result.compatibilityState, 'unknown')
+  assert.equal(result.incompatibilityReason, 'LOCAL_AGENT_AUTH_REQUIRED')
+  const help = await probeAgentCapabilities('workbuddy', '/test/auth-help-workbuddy', {
+    env: {},
+    execFileFn: async () => ({ stdout: '--print --output-format --permission-mode --max-turns --resume json plan acceptEdits\nPlease log in first' }),
+  })
+  assert.equal(help.compatibilityState, 'compatible')
+})
+
+test('Agent detection accepts ambiguous product versions after successful capability probes', async () => {
+  let capabilityCalls = 0
+  const found = await detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'kimi' ? '/tmp/kimi' : null,
+    probeAgentCapabilitiesFn: async () => {
+      capabilityCalls += 1
+      return {
+        compatibilityState: 'compatible',
+        incompatibilityReason: '',
+        incompatibilityProbe: '',
+      }
+    },
+    execFileFn: async () => ({
+      stdout: 'Kimi Code 0.19.2\nKimi Code 0.20.0\n0.19.2\n',
+      stderr: '',
+    }),
+  })
+
+  assert.equal(capabilityCalls, 1)
+  assert.deepEqual(found, [{
+    kind: 'kimi',
+    name: 'Kimi CLI',
+    executable: '/tmp/kimi',
+    version: '',
+    versionIdentified: false,
+    resolvedVersion: '',
+    supportedVersionRange: '0.19.2..0.32.0',
+    compatibilityState: 'compatible',
+    incompatibilityReason: '',
+    incompatibilityProbe: '',
+  }])
+})
+
+test('Windows discovery uses the canonical PATH when casing variants coexist', async () => {
+  let detectedPath
+  await detectAgents({
+    platform: 'win32', env: { Path: 'C:\\old', PATH: 'C:\\new' },
+    resolveExecutableFn: async kind => kind === 'kimi' ? 'C:\\new\\kimi.exe' : null,
+    probeAgentCapabilitiesFn: async (_kind, _executable, options) => {
+      detectedPath = options.childEnv.PATH
+      return { compatibilityState: 'compatible', incompatibilityReason: '', incompatibilityProbe: '' }
+    },
+    execFileFn: async () => ({ stdout: 'Kimi Code 0.19.2', stderr: '' }),
+  })
+  assert.ok(detectedPath.split(';').includes('C:\\new'))
+  assert.equal(detectedPath.split(';').includes('C:\\old'), false)
+})
+
+test('Agent detection passes scoped native and system environment to version commands', async () => {
+  const calls = []
+  const found = await detectAgents({
+    platform: 'darwin',
+    home: '/Users/Ryder',
+    env: {
+      HOME: '/Users/Ryder',
+      LANG: 'zh_CN.UTF-8',
+      PATH: '/custom/bin',
+      MELDWORK_PRIVATE_VALUE: 'desktop-private-value',
+      OPENAI_API_KEY: 'provider-secret',
+      https_proxy: 'http://proxy.example:3128',
+      NO_PROXY: 'localhost,127.0.0.1',
+      REQUESTS_CA_BUNDLE: '/certs/company.pem',
+    },
+    resolveExecutableFn: async kind => kind === 'kimi' ? '/tmp/kimi' : null,
+    execFileFn: async (_command, args, options) => {
+      calls.push(options.env)
+      if (args[0] === '--version') return { stdout: '0.19.2\n', stderr: '' }
+      if (args[0] === '--help') {
+        return {
+          stdout: '--output-format --auto --session --prompt stream-json',
+          stderr: '',
+        }
+      }
+      return { stdout: 'Kimi ACP', stderr: '' }
+    },
+  })
+
+  assert.equal(found.length, 1)
+  assert.equal(calls.length, 3)
+  for (const env of calls) {
+    assert.equal(env.HOME, '/Users/Ryder')
+    assert.equal(env.LANG, 'zh_CN.UTF-8')
+    assert.match(env.PATH, /\/custom\/bin/)
+    assert.equal(env.MELDWORK_PRIVATE_VALUE, undefined)
+    assert.equal(env.OPENAI_API_KEY, 'provider-secret')
+    assert.equal(env.https_proxy, 'http://proxy.example:3128')
+    assert.equal(env.NO_PROXY, 'localhost,127.0.0.1')
+    assert.equal(env.REQUESTS_CA_BUNDLE, '/certs/company.pem')
+  }
+  assert.doesNotMatch(JSON.stringify(found), /provider-secret/)
+})
+
+test('Agent detection uses each Agent native environment without exposing its values in the catalog', async () => {
+  const { nativeCredentialEnvironment } = require('../../../src/agents/local-agent-readiness.cjs')
+  const shell = {
+    OPENAI_API_KEY: 'codex-private-token', ANTHROPIC_API_KEY: 'claude-private-token',
+    AWS_PROFILE: 'native-profile', AWS_DEFAULT_PROFILE: 'fallback-profile',
+    AWS_CA_BUNDLE: '/native/ca.pem', AWS_REGION: 'us-east-1',
+    AWS_CONTAINER_AUTHORIZATION_TOKEN: 'container-private-token',
+    UNRELATED_SECRET: 'unrelated-private-token',
+  }
+  const seen = new Map()
+  const found = await detectAgents({
+    platform: 'darwin', env: shell,
+    nativeEnvironmentForKind: kind => nativeCredentialEnvironment(kind, shell),
+    resolveExecutableFn: async kind => ['codex', 'claude'].includes(kind) ? `/tmp/${kind}` : null,
+    execFileFn: async (command, _args, options) => {
+      seen.set(command, options.env)
+      return { stdout: command.endsWith('codex')
+        ? 'codex-cli 0.147.0 codex-private-token' : 'Claude Code 2.1.0 claude-private-token', stderr: '' }
+    },
+    probeAgentCapabilitiesFn: async (_kind, executable, options) => {
+      assert.deepEqual(options.childEnv, seen.get(executable))
+      return { compatibilityState: 'compatible', incompatibilityReason: '', incompatibilityProbe: '' }
+    },
+  })
+  assert.equal(seen.get('/tmp/codex').OPENAI_API_KEY, shell.OPENAI_API_KEY)
+  assert.equal(seen.get('/tmp/codex').ANTHROPIC_API_KEY, undefined)
+  assert.equal(seen.get('/tmp/claude').ANTHROPIC_API_KEY, shell.ANTHROPIC_API_KEY)
+  assert.equal(seen.get('/tmp/claude').AWS_PROFILE, shell.AWS_PROFILE)
+  assert.equal(seen.get('/tmp/claude').AWS_DEFAULT_PROFILE, shell.AWS_DEFAULT_PROFILE)
+  assert.equal(seen.get('/tmp/claude').AWS_CA_BUNDLE, shell.AWS_CA_BUNDLE)
+  assert.equal(seen.get('/tmp/codex').AWS_DEFAULT_PROFILE, undefined)
+  assert.equal(seen.get('/tmp/claude').AWS_REGION, shell.AWS_REGION)
+  assert.equal(seen.get('/tmp/claude').AWS_CONTAINER_AUTHORIZATION_TOKEN, shell.AWS_CONTAINER_AUTHORIZATION_TOKEN)
+  assert.equal(seen.get('/tmp/claude').OPENAI_API_KEY, undefined)
+  assert.equal(seen.get('/tmp/claude').UNRELATED_SECRET, undefined)
+  assert.doesNotMatch(JSON.stringify(found), /(?:codex|claude)-private-token/)
+})
+
+test('Agent detection retains a broken installation with unavailable capabilities', async () => {
+  const found = await detectAgents({
+    platform: 'darwin',
+    env: {},
+    resolveExecutableFn: async kind => kind === 'codex' ? '/tmp/codex' : null,
+    execFileFn: async () => { throw new Error('broken shim') },
+  })
+
+  assert.equal(found.length, 1)
+  assert.equal(found[0].kind, 'codex')
+  assert.equal(found[0].compatibilityState, 'incompatible')
+  assert.equal(found[0].incompatibilityReason, 'LOCAL_AGENT_REQUIRED_CAPABILITY_MISSING')
+})
+
+test('Agent detection uses capability evidence when the version command fails', async () => {
+  const found = await detectAgents({
+    env: { CODEX_HOME: '/tmp/custom-codex' },
+    resolveExecutableFn: async kind => kind === 'codex' ? '/tmp/codex' : null,
+    execFileFn: async (_command, args, options) => {
+      assert.equal(options.env.CODEX_HOME, '/tmp/custom-codex')
+      if (args[0] === '--version') throw Object.assign(new Error('timeout'), { killed: true })
+      return { stdout: '--json --sandbox --skip-git-repo-check --image read-only workspace-write' }
+    },
+  })
+  assert.equal(found.length, 1)
+  assert.equal(found[0].compatibilityState, 'compatible')
+})
+
+test('Agent detection keeps native configuration directories scoped to their owner', async () => {
+  const calls = []
+  await detectAgents({
+    platform: 'darwin',
+    env: { CODEX_HOME: '/native/codex', CLAUDE_CONFIG_DIR: '/native/claude', PI_CODING_AGENT_DIR: '/native/pi' },
+    resolveExecutableFn: async kind => ['codex', 'claude'].includes(kind) ? `/tmp/${kind}` : null,
+    execFileFn: async (command, _args, options) => {
+      calls.push({ command, env: options.env })
+      throw new Error('probe unavailable')
+    },
+  })
+  assert.ok(calls.some(call => call.command === '/tmp/codex'))
+  assert.ok(calls.some(call => call.command === '/tmp/claude'))
+  for (const call of calls) {
+    assert.equal(call.env.CODEX_HOME, call.command === '/tmp/codex' ? '/native/codex' : undefined)
+    assert.equal(call.env.CLAUDE_CONFIG_DIR, call.command === '/tmp/claude' ? '/native/claude' : undefined)
+    assert.equal(call.env.PI_CODING_AGENT_DIR, undefined)
+  }
+})
+
+test('direct capability probes use only their own native configuration directory', async () => {
+  const seen = []
+  await probeAgentCapabilities('codex', '/tmp/codex-direct', {
+    platform: 'darwin',
+    env: { CODEX_HOME: '/native/codex', CLAUDE_CONFIG_DIR: '/native/claude' },
+    execFileFn: async (_command, _args, options) => {
+      seen.push(options.env)
+      throw new Error('probe unavailable')
+    },
+  })
+  assert.ok(seen.length)
+  for (const env of seen) {
+    assert.equal(env.CODEX_HOME, '/native/codex')
+    assert.equal(env.CLAUDE_CONFIG_DIR, undefined)
+  }
+})
+
+test('direct probes use the same Agent-scoped native environment as execution', async () => {
+  const seen = []
+  await probeAgentCapabilities('claude', '/tmp/claude-direct', {
+    platform: 'darwin', env: { ANTHROPIC_API_KEY: 'claude-private', AWS_PROFILE: 'native-profile',
+      GEMINI_API_KEY: 'gemini-private', HTTPS_PROXY: 'http://proxy.example:3128' },
+    execFileFn: async (_command, _args, options) => { seen.push(options.env); throw new Error('unavailable') },
+  })
+  assert.ok(seen.length)
+  for (const env of seen) {
+    assert.equal(env.ANTHROPIC_API_KEY, 'claude-private')
+    assert.equal(env.AWS_PROFILE, 'native-profile')
+    assert.equal(env.HTTPS_PROXY, 'http://proxy.example:3128')
+    assert.equal(env.GEMINI_API_KEY, undefined)
+  }
+})
+
+test('direct Windows probes canonicalize native environment variable names', async () => {
+  const seen = []
+  await probeAgentCapabilities('claude', 'C:\\tools\\claude.exe', {
+    platform: 'win32', env: { anthropic_api_key: 'native-secret', vertex_region_model: 'region-a' },
+    execFileFn: async (_command, _args, options) => { seen.push(options.env); throw new Error('unavailable') },
+  })
+  assert.ok(seen.length)
+  assert.equal(seen[0].ANTHROPIC_API_KEY, 'native-secret')
+  assert.equal(seen[0].VERTEX_REGION_MODEL, 'region-a')
+})
+
+test('direct OpenClaw probes do not inherit ambient provider credentials', async () => {
+  const seen = []
+  await probeAgentCapabilities('openclaw', '/tmp/openclaw-direct', {
+    env: { OPENAI_API_KEY: 'ambient-secret', OPENROUTER_API_KEY: 'other-secret' },
+    execFileFn: async (_command, _args, options) => { seen.push(options.env); throw new Error('unavailable') },
+  })
+  assert.ok(seen.length)
+  for (const env of seen) {
+    assert.equal(env.OPENAI_API_KEY, undefined)
+    assert.equal(env.OPENROUTER_API_KEY, undefined)
+  }
+})
+
+test('direct probes use every supported native directory without leaking other Agents configuration', async () => {
+  const entries = { codex: 'CODEX_HOME', hermes: 'HERMES_HOME', claude: 'CLAUDE_CONFIG_DIR',
+    pi: 'PI_CODING_AGENT_DIR', deepseek: 'DSH_HOME', workbuddy: 'CODEBUDDY_CONFIG_DIR' }
+  const env = Object.fromEntries(Object.entries(entries).map(([kind, key]) => [key, `/native/${kind}`]))
+  env.DSH_AGENTS_HOME = '/native/shared'
+  for (const [kind, key] of Object.entries(entries)) {
+    const seen = []
+    await probeAgentCapabilities(kind, `/tmp/${kind}-native-direct`, {
+      env, execFileFn: async (_command, _args, options) => { seen.push(options.env); throw new Error('unavailable') },
+    })
+    if (!seen.length) continue // Agents without capability probes launch no child process.
+    for (const child of seen) {
+      assert.equal(child[key], env[key], kind)
+      for (const [otherKind, otherKey] of Object.entries(entries)) {
+        if (otherKind !== kind) assert.equal(child[otherKey], undefined, `${kind}: ${otherKey}`)
+      }
+      assert.equal(child.DSH_AGENTS_HOME, kind === 'deepseek' ? env.DSH_AGENTS_HOME : undefined)
+    }
+  }
+})
+
+test('runAgent hides executable paths from spawn failures', async () => {
+  const child = new EventEmitter()
+  child.stdin = new PassThrough()
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.kill = () => true
+  const outcome = runAgent(
+    { kind: 'codex', executable: '/private/agents/codex', name: 'Codex' },
+    'hello',
+    '/private/workspace',
+    { spawnFn: () => child },
+  )
+
+  child.emit('error', new Error('spawn /private/agents/codex ENOENT'))
+
+  await assert.rejects(outcome, (error) => {
+    assert.equal(error.message, 'LOCAL_AGENT_SPAWN_FAILED')
+    assert.doesNotMatch(error.message, /private|codex/)
+    assert.equal(error.diagnostic, 'spawn /private/agents/codex ENOENT')
+    assert.equal(Object.prototype.propertyIsEnumerable.call(error, 'diagnostic'), false)
+    return true
+  })
+
+  await assert.rejects(
+    runAgent(
+      { kind: 'codex', executable: '/private/agents/codex', name: 'Codex' },
+      'hello',
+      '/private/workspace',
+      { spawnFn: () => { throw new Error('spawn /private/agents/codex ENOENT') } },
+    ),
+    (error) => {
+      assert.equal(error.message, 'LOCAL_AGENT_SPAWN_FAILED')
+      assert.equal(error.diagnostic, 'spawn /private/agents/codex ENOENT')
+      assert.equal(Object.prototype.propertyIsEnumerable.call(error, 'diagnostic'), false)
+      return true
+    },
+  )
+})
+
+test('runAgent escalates cancellation when the CLI ignores SIGTERM', {
+  skip: process.platform === 'win32',
+}, async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'meldwork-cli-abort-'))
+  const readyFile = path.join(directory, 'ready')
+  const cli = executable(directory, 'ignore-term.cjs', `
+const fs = require('node:fs')
+fs.writeFileSync(process.argv.at(-1), String(process.pid))
+process.on('SIGTERM', () => {})
+setInterval(() => {}, 1000)
+`)
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  const controller = new AbortController()
+  const outcome = runAgent(
+    { kind: 'hermes', executable: cli, name: 'Hermes' },
+    readyFile,
+    directory,
+    { signal: controller.signal, hermesAcpAvailable: false, hermesMessageWatermarkFn: () => 0 },
+  ).then(value => ({ value }), error => ({ error }))
+  const pid = Number(await readWhenReady(readyFile))
+
+  controller.abort()
+
+  const result = await within(outcome)
+  assert.equal(result.error?.message, 'LOCAL_AGENT_EXECUTION_STOPPED')
+  await waitForExit(pid)
+})
+
+test('runAgent converts a closed stdin pipe into a bounded send failure', async () => {
+  const child = new EventEmitter()
+  child.stdin = new PassThrough()
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  let killed = false
+  child.kill = () => {
+    if (killed) return true
+    killed = true
+    process.nextTick(() => child.emit('close', 1, 'SIGTERM'))
+    return true
+  }
+  process.nextTick(() => child.stdin.destroy(new Error('write EPIPE')))
+
+  await assert.rejects(
+    runAgent(
+      { kind: 'codex', executable: '/tmp/codex', name: 'Codex' },
+      'send this reliably',
+      os.tmpdir(),
+      { spawnFn: () => child },
+    ),
+    error => error?.message === 'LOCAL_AGENT_SEND_FAILED',
+  )
+})
+
+test('runAgent cancellation closes pipes inherited by a descendant process', {
+  skip: process.platform === 'win32',
+}, async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'meldwork-cli-tree-'))
+  const readyFile = path.join(directory, 'ready.json')
+  const cli = executable(directory, 'spawn-descendant.cjs', `
+const fs = require('node:fs')
+const { spawn } = require('node:child_process')
+const descendant = spawn(process.execPath, ['-e', [
+  "process.on('SIGTERM', () => {})",
+  'setInterval(() => {}, 1000)',
+].join(';')], { stdio: ['ignore', 'inherit', 'inherit'] })
+fs.writeFileSync(process.argv.at(-1), JSON.stringify({ parent: process.pid, descendant: descendant.pid }))
+setInterval(() => {}, 1000)
+`)
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  const controller = new AbortController()
+  const outcome = runAgent(
+    { kind: 'hermes', executable: cli, name: 'Hermes' },
+    readyFile,
+    directory,
+    { signal: controller.signal, hermesAcpAvailable: false, hermesMessageWatermarkFn: () => 0 },
+  ).then(value => ({ value }), error => ({ error }))
+  const pids = await readJsonWhenReady(readyFile)
+
+  controller.abort()
+
+  const result = await within(outcome)
+  assert.equal(result.error?.message, 'LOCAL_AGENT_EXECUTION_STOPPED')
+  await Promise.all([waitForExit(pids.parent), waitForExit(pids.descendant)])
+})
+
+test('Windows Agent cancellation terminates the full process tree with taskkill', async () => {
+  const controller = new AbortController()
+  const child = new EventEmitter()
+  child.pid = 4321
+  child.stdin = new PassThrough()
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.kill = () => true
+  const killer = new EventEmitter()
+  killer.unref = () => {}
+  const calls = []
+  const outcome = runAgent(
+    { kind: 'codex', executable: 'C:\\Tools\\codex.exe', name: 'Codex' },
+    'hello',
+    'C:\\work',
+    {
+      platform: 'win32',
+      signal: controller.signal,
+      spawnFn: (command, args, options) => {
+        calls.push({ command, args, options })
+        return calls.length === 1 ? child : killer
+      },
+    },
+  )
+
+  controller.abort()
+  child.emit('close', 1, 'SIGTERM')
+  killer.emit('close', 0)
+
+  await assert.rejects(outcome, { message: 'LOCAL_AGENT_EXECUTION_STOPPED' })
+  assert.equal(calls[1].command, 'taskkill.exe')
+  assert.deepEqual(calls[1].args, ['/PID', '4321', '/T', '/F'])
+})
+
+test('Windows Agent cancellation reports taskkill failures instead of claiming a stop', async () => {
+  for (const mode of ['spawn-error', 'process-error', 'nonzero', 'still-alive', 'timeout']) {
+    const controller = new AbortController()
+    const child = new EventEmitter()
+    child.pid = 4321
+    child.stdin = new PassThrough()
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.kill = () => true
+    const killer = new EventEmitter()
+    killer.unref = () => {}
+    let calls = 0
+    const outcome = runAgent({ kind: 'codex', executable: 'C:\\Tools\\codex.exe' }, 'hello', 'C:\\work', {
+      platform: 'win32', signal: controller.signal,
+      spawnFn: () => {
+        calls += 1
+        if (calls === 1) return child
+        if (mode === 'spawn-error') throw new Error('taskkill unavailable')
+        return killer
+      },
+    })
+    controller.abort()
+    if (mode === 'process-error') killer.emit('error', new Error('taskkill failed'))
+    if (mode === 'nonzero') killer.emit('close', 1)
+    if (mode === 'still-alive') killer.emit('close', 0)
+    await assert.rejects(outcome, { message: 'LOCAL_AGENT_TERMINATION_FAILED' }, mode)
+  }
+})

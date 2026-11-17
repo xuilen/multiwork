@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <defs>
+    <linearGradient id="antigravity-main" x1="48" y1="32" x2="208" y2="216" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1A73E8"/>
+      <stop offset="0.55" stop-color="#3B82F6"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="antigravity-orbit" x1="36" y1="164" x2="222" y2="104" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0EA5E9"/>
+      <stop offset="1" stop-color="#6366F1"/>
+    </linearGradient>
+  </defs>
+  <path fill-rule="evenodd" clip-rule="evenodd" d="M128 32L50 214H84L101 174H155L172 214H206L128 32ZM128 88L110 142H146L128 88Z" fill="url(#antigravity-main)"/>
+  <path d="M36 164C76 196 184 182 222 104" stroke="url(#antigravity-orbit)" stroke-width="14" stroke-linecap="round"/>
+</svg>

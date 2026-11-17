@@ -1,0 +1,1198 @@
+const electron = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, Menu, Notification, protocol, shell } = electron
+const fs = require('node:fs')
+const path = require('node:path')
+// Keep the profile, key storage and single-instance lock together on upgrade.
+if (app.isPackaged && !app.commandLine.hasSwitch('user-data-dir')) {
+  const oldProfile = path.join(app.getPath('appData'), 'meldwork-studio')
+  if (fs.existsSync(path.join(oldProfile, 'Local State')) || fs.existsSync(path.join(oldProfile, 'meldwork-workspace.json'))) {
+    app.setPath('userData', oldProfile)
+    app.setPath('sessionData', oldProfile)
+  }
+}
+const { redactSecrets } = require('./security/secret-redaction.cjs')
+const { ensurePrivateDirectory } = require('./security/private-file.cjs')
+const { agentVerificationIdentity, projectVerificationIdentity } = require('./workspace/agent-verification-identity.cjs')
+const { NATIVE_CONFIG_DIRECTORIES, NATIVE_CONFIG_IDENTITY_DIRECTORY, NATIVE_ENVIRONMENT_IDENTITY, NATIVE_AUTH_IDENTITY_FILES, NATIVE_PROJECT_CONFIG_PATHS,
+  nativeConfigEnvironment, nativeIdentityDirectory, nativeEnvironmentIdentity, nativeAuthIdentityFiles, nativeProjectConfigPaths, nativeNetworkIdentityFiles, validateNativeConfigDirectory } = require('./agents/native-config-directory.cjs')
+const { AttachmentStore } = require('./attachments/attachment-store.cjs')
+const { ContentBlobStore } = require('./attachments/content-blob-store.cjs')
+const { ContextPackStore } = require('./collaboration/context-pack-store.cjs')
+const { OutcomeStore } = require('./collaboration/outcome-store.cjs')
+const FROZEN_AGENT_FIT_MATRIX = require('./evaluations/data/agent-fit-matrix.v1.json')
+const {
+  MEDIA_SCHEME,
+  attachmentIdsFromSnapshot,
+  createAttachmentService,
+  persistedAttachmentReferences,
+} = require('./attachments/attachment-service.cjs')
+const {
+  captureAgentOutputState,
+  captureAgentOutcomeDescriptors,
+  captureArtifactOutputState,
+  importAgentOutputs,
+} = require('./agents/agent-output-importer.cjs')
+const {
+  detectAgents,
+  imageAttachmentLimit,
+  runAgent,
+  shutdownAcpSessionRuntime,
+} = require('./agents/cli/cli-adapters.cjs')
+const { AgentInstaller } = require('./agents/installer/agent-installer.cjs')
+const { networkEnvironment } = require('./agents/cli/cli-network-environment.cjs')
+const { ocrDeclaredCredentialKeys } = require('./agents/cli/ocr-provider-environment.cjs')
+const { mimoDeclaredCredentialKeys } = require('./agents/cli/mimo-native-config.cjs')
+const { qwenDeclaredCredentialKeys } = require('./agents/cli/qwen-native-config.cjs')
+const { opencodeDeclaredCredentialKeys } = require('./agents/cli/opencode-native-config.cjs')
+const { AgentConnectorInstanceStore } = require('./agents/connectors/agent-connector-instance-store.cjs')
+const { LocalAgentConnectors } = require('./agents/connectors/agent-connector-local.cjs')
+const { AgentConnectorPackageStore } = require('./agents/connectors/agent-connector-package-store.cjs')
+const { CloudAgentOperationStore } = require('./agents/cloud/cloud-agent-operation-store.cjs')
+const { CloudAgentBridgeStore } = require('./agents/cloud/cloud-agent-bridge.cjs')
+const {
+  CloudAgentRuntime,
+  createCloudAgentStartRetry = ({ runtime }) => Object.freeze({
+    start: () => Promise.resolve().then(() => runtime.start()).then(() => true, () => false),
+    cancel() {},
+  }),
+} = require('./agents/cloud/cloud-agent-runtime.cjs')
+const { ChannelInboxStore } = require('./channels/channel-inbox-store.cjs')
+const { ChannelIngressRuntime } = require('./channels/channel-ingress-runtime.cjs')
+const { CustomAgentStore } = require('./agents/custom-agent-store.cjs')
+const { configDirectoryEnvironment } = require('./agents/cli/cli-config-directories.cjs')
+const { nativeUserConfigSummary } = require('./agents/native-config-summary.cjs')
+const { deepseekNativeConfig } = require('./agents/cli/deepseek-native-config.cjs')
+const { hermesConfiguredProvider } = require('./agents/hermes-config-summary.cjs')
+const { codexConfiguredProvider } = require('./agents/codex-config-summary.cjs')
+const {
+  codexDeclaredCredentialKeys,
+  hermesDeclaredCredentialKeys,
+  zcodeDeclaredCredentialKeys,
+  nativeCredentialEnvironment,
+  piDeclaredCredentialKeys,
+  resolveNativeOpenClawRuntime,
+  resolveNativeCredentialState,
+  resolveNativeShellEnvironment,
+} = require('./agents/local-agent-readiness.cjs')
+const { LocalWorkspace } = require('./workspace/local-workspace.cjs')
+const { registerDesktopIpc } = require('./shell/main-ipc.cjs')
+const { workBuddyEnvironment, workBuddySettings } = require('./agents/cli/workbuddy-runtime.cjs')
+const {
+  isAllowedExternalUrl,
+  isAllowedLocalNavigation: isAllowedLocalNavigationForPaths,
+  isTrustedLocalRenderer,
+  isTrustedLocalWebContents: isTrustedLocalWebContentsForPath,
+} = require('./shell/main-renderer-security.cjs')
+const { createRunNotificationCoordinator } = require('./shell/main-run-notifications.cjs')
+const { normalizeRunEvent } = require('./runs/run-harness.cjs')
+const { RunLedger } = require('./runs/run-ledger.cjs')
+const { LocalSkillCatalog } = require('./skills/local-skill-catalog.cjs')
+const { LocalSkillSnapshotSelections } = require('./skills/local-skill-snapshot-selections.cjs')
+const { LocalSkillSnapshotStore } = require('./skills/local-skill-snapshot.cjs')
+const { LocalSkillTrustStore } = require('./skills/local-skill-trust-store.cjs')
+const { KnowledgeBaseStore } = require('./knowledge/knowledge-base-store.cjs')
+const {
+  knowledgeBaseSelectionHint,
+  knowledgeBaseGuideUrl,
+  resolveKnowledgeBaseSources,
+} = require('./knowledge/local-knowledge-base.cjs')
+const { LocalKnowledgeConnectors } = require('./knowledge/local-knowledge-connectors.cjs')
+const { nativeOpenClawOptions } = require('./agents/cli/openclaw-runtime.cjs')
+const { migrateLegacyProductData } = require('./product-data-migration.cjs')
+const LOCAL_AGENT_KINDS = new Set([
+  'codex', 'hermes', 'openclaw', 'workbuddy', 'zcode', 'pi', 'kimi', 'mimo', 'deepseek', 'claude', 'gemini', 'antigravity', 'opencode', 'qwen',
+  'opencodereview',
+])
+const QUIT_CLEANUP_TIMEOUT_MS = 2500
+let mainWindow = null
+
+// Faults outside a request handler are written to a small private log in
+// userData (secrets redacted, size-capped) instead of disappearing or
+// taking the app down, so instability reports have evidence.
+function recordMainProcessFault(kind, detail) {
+  const text = String(detail?.stack || detail?.message || detail || '').slice(0, 4000)
+  console.error(`[meldwork] ${kind}`, text)
+  try {
+    const file = path.join(app.getPath('userData'), 'meldwork-diagnostics.log')
+    try {
+      if (fs.statSync(file).size > 1024 * 1024) fs.renameSync(file, `${file}.1`)
+    } catch { /* first entry */ }
+    fs.appendFileSync(file, `${new Date().toISOString()} ${kind} ${redactSecrets(text)}\n`, { mode: 0o600 })
+  } catch { /* diagnostics must never throw */ }
+}
+process.on('unhandledRejection', reason => recordMainProcessFault('unhandledRejection', reason))
+process.on('uncaughtException', error => recordMainProcessFault('uncaughtException', error))
+let workspace = null
+let workspaceStartupError = ''
+let workspaceChangedListener = null
+let workspaceRunFinishedListener = null
+let workspaceRunEventListener = null
+let installer = null
+let nativeSkillDirectories = {}
+let localAgentRefreshQueue = Promise.resolve()
+let customAgentStore = null
+let agentConnectors = null
+let cloudAgentRuntime = null
+let cloudAgentBridges = null
+let cloudAgentStartRetry = null
+let channelIngressRuntime = null
+let knowledgeBaseStore = null
+let knowledgeConnectors = null
+let knowledgeBaseStatusPromise = null
+const knowledgeBaseSourcesCache = new Map()
+let attachmentStore = null
+let skillCatalog = null
+let skillTrustStore = null
+let shutdownStarted = false
+const knowledgeInstallShutdown = new AbortController()
+let quitCleanup = null
+let cachedAppIcon
+
+function runQuitCleanup(cleanups, timeoutMs = QUIT_CLEANUP_TIMEOUT_MS) {
+  const tasks = cleanups.map((cleanup) => {
+    try {
+      return Promise.resolve(cleanup())
+    } catch (error) {
+      return Promise.reject(error)
+    }
+  })
+  const pending = Promise.allSettled(tasks)
+  return new Promise((resolve) => {
+    let settled = false
+    let timer = null
+    const finish = (timedOut) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      resolve({ timedOut })
+    }
+    pending.then(() => finish(false))
+    timer = setTimeout(() => finish(true), timeoutMs)
+  })
+}
+
+const attachments = createAttachmentService({
+  getStore: () => attachmentStore,
+  getSnapshot: () => workspace?.snapshot(),
+  nativeImage: electron.nativeImage,
+  openPath: filename => shell.openPath(filename),
+})
+
+protocol?.registerSchemesAsPrivileged?.([{
+  scheme: MEDIA_SCHEME,
+  privileges: {
+    standard: true,
+    secure: true,
+    supportFetchAPI: true,
+    stream: true,
+  },
+}])
+
+const lazySafeStorage = Object.freeze({
+  isEncryptionAvailable: () => electron.safeStorage.isEncryptionAvailable(),
+  encryptString: value => electron.safeStorage.encryptString(value),
+  decryptString: value => electron.safeStorage.decryptString(value),
+})
+
+function frontendPath() {
+  return app.isPackaged
+    ? path.join(__dirname, '../frontend/index.html')
+    : path.resolve(__dirname, '../../frontend/dist/index.html')
+}
+
+function offlinePath() {
+  return path.join(__dirname, 'offline.html')
+}
+
+function appIconPath() {
+  return app.isPackaged
+    ? path.join(__dirname, '../frontend/logos/multiwork-icon.png')
+    : path.resolve(__dirname, '../../frontend/public/logos/multiwork-icon.png')
+}
+
+function appIconImage() {
+  if (cachedAppIcon !== undefined) return cachedAppIcon
+  try {
+    const image = electron.nativeImage.createFromPath(appIconPath())
+    cachedAppIcon = image?.isEmpty?.() === false ? image : null
+  } catch {
+    cachedAppIcon = null
+  }
+  return cachedAppIcon
+}
+
+function isLocalAgentKind(kind) {
+  return LOCAL_AGENT_KINDS.has(kind)
+    || customAgentStore?.has(kind) === true
+    || agentConnectors?.has(kind) === true
+}
+
+function loadFrontend() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.loadFile(frontendPath(), { hash: '/chat' }).catch(() => showOfflinePage('FRONTEND_LOAD_FAILED'))
+}
+
+function showOfflinePage(errorCode) {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.loadFile(offlinePath(), {
+    query: { code: String(errorCode) },
+  }).catch(() => {})
+}
+
+function isTrustedLocalWebContents(webContents, expectedFrontendPath = frontendPath()) {
+  return isTrustedLocalWebContentsForPath(webContents, expectedFrontendPath)
+}
+
+function requireDesktopRenderer(event) {
+  if (!isTrustedLocalRenderer(event, mainWindow?.webContents, frontendPath())) {
+    throw new Error('DESKTOP_CLIENT_ACCESS_DENIED')
+  }
+}
+
+function registerTrustedHandle(channel, handler) {
+  ipcMain.handle(channel, (event, ...args) => {
+    requireDesktopRenderer(event)
+    if (shutdownStarted) throw new Error('DESKTOP_CLIENT_SHUTTING_DOWN')
+    return handler(...args)
+  })
+}
+
+function isAllowedLocalNavigation(value, allowedPaths = [frontendPath(), offlinePath()]) {
+  return isAllowedLocalNavigationForPaths(value, allowedPaths)
+}
+
+function openExternalUrl(value) {
+  if (!isAllowedExternalUrl(value)) return false
+  Promise.resolve(shell.openExternal(value)).catch(() => {})
+  return true
+}
+
+async function nativeShellEnvironment(options = {}) {
+  const home = app.getPath('home')
+  let resolved = await resolveNativeShellEnvironment({ home, refresh: options.refresh === true })
+  const initialEnv = { ...process.env, ...resolved.env }
+  for (const key of resolved.unsetKeys || []) delete initialEnv[key]
+  const codexEnv = nativeConfigEnvironment('codex', workspace?.state.agentPreferences, initialEnv)
+  const codexCredentialKeys = codexDeclaredCredentialKeys({ home, env: codexEnv })
+  const hermesEnv = nativeConfigEnvironment('hermes', workspace?.state.agentPreferences, initialEnv)
+  const hermesCredentialKeys = hermesDeclaredCredentialKeys({ home, env: hermesEnv })
+  const deepseekEnv = nativeConfigEnvironment('deepseek', workspace?.state.agentPreferences, initialEnv)
+  const deepseekCredentialKeys = deepseekNativeConfig({ home, env: deepseekEnv }).credentialKeys
+  const zcodeEnv = nativeConfigEnvironment('zcode', workspace?.state.agentPreferences, initialEnv)
+  const zcodeCredentialKeys = zcodeDeclaredCredentialKeys({ home, workdir: options.workdir, env: zcodeEnv })
+  const qwenEnv = nativeConfigEnvironment('qwen', workspace?.state.agentPreferences, initialEnv)
+  const qwenCredentialKeys = qwenDeclaredCredentialKeys({ home, workdir: options.workdir, env: qwenEnv })
+  const ocrEnv = nativeConfigEnvironment('opencodereview', workspace?.state.agentPreferences, initialEnv)
+  const ocrCredentialKeys = ocrDeclaredCredentialKeys({ home, env: ocrEnv })
+  const piEnv = nativeConfigEnvironment('pi', workspace?.state.agentPreferences, initialEnv)
+  const piCredentialKeys = piDeclaredCredentialKeys({ home, env: piEnv })
+  const opencodeEnv = nativeConfigEnvironment('opencode', workspace?.state.agentPreferences, initialEnv)
+  let opencodeCredentialKeys = opencodeDeclaredCredentialKeys({ home, env: opencodeEnv, workdir: options.workdir })
+  const mimoEnv = nativeConfigEnvironment('mimo', workspace?.state.agentPreferences, initialEnv)
+  let mimoCredentialKeys = mimoDeclaredCredentialKeys({ home, env: mimoEnv, workdir: options.workdir })
+  for (let pass = 0; pass < 2; pass += 1) {
+    const declaredKeys = [...new Set([...codexCredentialKeys, ...hermesCredentialKeys, ...zcodeCredentialKeys, ...piCredentialKeys,
+      ...opencodeCredentialKeys, ...mimoCredentialKeys, ...deepseekCredentialKeys, ...qwenCredentialKeys, ...ocrCredentialKeys])]
+    if (!declaredKeys.length) break
+    const chunks = []
+    for (let index = 0; index < declaredKeys.length; index += 32) chunks.push(declaredKeys.slice(index, index + 32))
+    const results = await Promise.all(chunks.map(extraEnvKeys => resolveNativeShellEnvironment({
+      home, refresh: options.refresh === true, extraEnvKeys,
+    })))
+    const extra = {}
+    const unset = []
+    for (let index = 0; index < chunks.length; index += 1) {
+      for (const key of chunks[index]) {
+        if (Object.hasOwn(results[index].env, key)) extra[key] = results[index].env[key]
+        if (results[index].unsetKeys?.includes(key)) unset.push(key)
+      }
+    }
+    resolved = { ...resolved, env: { ...resolved.env, ...extra },
+      unsetKeys: [...new Set([...(resolved.unsetKeys || []).filter(key => !declaredKeys.includes(key)),
+        ...unset])] }
+    if (pass === 0) {
+      const enriched = { ...process.env, ...resolved.env }
+      for (const key of resolved.unsetKeys || []) delete enriched[key]
+      const nextEnv = nativeConfigEnvironment('opencode', workspace?.state.agentPreferences, enriched)
+      const nextKeys = opencodeDeclaredCredentialKeys({ home, env: nextEnv, workdir: options.workdir })
+      const nextMimoEnv = nativeConfigEnvironment('mimo', workspace?.state.agentPreferences, enriched)
+      const nextMimoKeys = mimoDeclaredCredentialKeys({ home, env: nextMimoEnv, workdir: options.workdir })
+      const needsAnotherPass = nextKeys.some(key => !opencodeCredentialKeys.includes(key))
+        || nextMimoKeys.some(key => !mimoCredentialKeys.includes(key))
+      opencodeCredentialKeys = nextKeys
+      mimoCredentialKeys = nextMimoKeys
+      if (needsAnotherPass) continue
+    }
+    break
+  }
+  const env = { ...process.env, ...resolved.env }
+  for (const key of resolved.unsetKeys || []) delete env[key]
+  opencodeCredentialKeys = opencodeCredentialKeys.filter(key => typeof env[key] === 'string' && env[key].length > 0)
+  for (const [kind, { key }] of Object.entries(NATIVE_CONFIG_DIRECTORIES)) {
+    if (kind === 'zcode' || kind === 'opencodereview') continue
+    if (kind === 'qwen') {
+      const directory = (process.platform === 'win32' ? env.USERPROFILE : env.HOME) || ''
+      if (Object.hasOwn(nativeSkillDirectories, key) && nativeSkillDirectories[key] !== directory) skillCatalog?.invalidate(kind)
+      nativeSkillDirectories[key] = directory
+      continue
+    }
+    const directory = typeof env[key] === 'string' ? env[key] : ''
+    if ((nativeSkillDirectories[key] || '') !== directory) skillCatalog?.invalidate(kind)
+    nativeSkillDirectories[key] = directory
+  }
+  const sharedDirectory = typeof env.DSH_AGENTS_HOME === 'string' ? env.DSH_AGENTS_HOME : ''
+  if ((nativeSkillDirectories.DSH_AGENTS_HOME || '') !== sharedDirectory) skillCatalog?.invalidate('deepseek')
+  nativeSkillDirectories.DSH_AGENTS_HOME = sharedDirectory
+  const xdgConfig = typeof env.XDG_CONFIG_HOME === 'string' && path.isAbsolute(env.XDG_CONFIG_HOME)
+    ? env.XDG_CONFIG_HOME : ''
+  if ((nativeSkillDirectories.XDG_CONFIG_HOME || '') !== xdgConfig) skillCatalog?.invalidate('opencode')
+  nativeSkillDirectories.XDG_CONFIG_HOME = xdgConfig
+  return {
+    ...resolved,
+    env,
+    home,
+    codexCredentialKeys,
+    hermesCredentialKeys,
+    deepseekCredentialKeys,
+    zcodeCredentialKeys,
+    qwenCredentialKeys,
+    ocrCredentialKeys,
+    piCredentialKeys,
+    opencodeCredentialKeys,
+    mimoCredentialKeys,
+  }
+}
+
+function nativeDeclaredCredentialKeys(kind, captured) {
+  const properties = {
+    codex: 'codexCredentialKeys', hermes: 'hermesCredentialKeys', zcode: 'zcodeCredentialKeys',
+    pi: 'piCredentialKeys', opencode: 'opencodeCredentialKeys', mimo: 'mimoCredentialKeys',
+    deepseek: 'deepseekCredentialKeys', qwen: 'qwenCredentialKeys', opencodereview: 'ocrCredentialKeys',
+  }
+  const keys = Object.hasOwn(properties, kind) ? captured?.[properties[kind]] || [] : []
+  return kind === 'codex' ? ['CODEX_API_KEY', ...keys] : keys
+}
+
+async function detectLocalAgents() {
+  const shellEnvironment = await nativeShellEnvironment()
+  const agents = await detectAgents({
+    env: shellEnvironment.env,
+    home: shellEnvironment.home,
+    nativeCredentialKeysForKind: kind => nativeDeclaredCredentialKeys(kind, shellEnvironment),
+    nativeEnvironmentForKind: kind => kind === 'openclaw'
+      ? {} : nativeCredentialEnvironment(kind, nativeConfigEnvironment(kind, workspace?.state.agentPreferences, shellEnvironment.env),
+        nativeDeclaredCredentialKeys(kind, shellEnvironment)),
+  })
+  return agents.map(agent => {
+    const env = nativeConfigEnvironment(agent.kind, workspace?.state.agentPreferences, shellEnvironment.env)
+    const directory = nativeIdentityDirectory(agent.kind, env, shellEnvironment.home)
+    const result = { ...agent }
+    if (directory) Object.defineProperty(result, NATIVE_CONFIG_IDENTITY_DIRECTORY, { value: directory })
+    const authFiles = [...new Set([...nativeAuthIdentityFiles(agent.kind, env, shellEnvironment.home),
+      ...nativeNetworkIdentityFiles(env)])]
+    if (authFiles.length) Object.defineProperty(result, NATIVE_AUTH_IDENTITY_FILES, { value: authFiles })
+    const projectPaths = nativeProjectConfigPaths(agent.kind, env)
+    if (projectPaths.length) Object.defineProperty(result, NATIVE_PROJECT_CONFIG_PATHS, { value: projectPaths })
+    if (agent.kind !== 'openclaw') {
+      const keys = nativeDeclaredCredentialKeys(agent.kind, shellEnvironment)
+      const fingerprint = nativeEnvironmentIdentity({
+        ...(env.PATH ? { PATH: env.PATH } : {}),
+        ...networkEnvironment(env), ...configDirectoryEnvironment(env),
+        ...nativeCredentialEnvironment(agent.kind, env, keys),
+      })
+      Object.defineProperty(result, NATIVE_ENVIRONMENT_IDENTITY, { value: fingerprint, enumerable: true })
+    }
+    return result
+  })
+}
+
+async function resolveProjectEnvironmentIdentities(workdir, kinds) {
+  const captured = await nativeShellEnvironment({ workdir, refresh: true })
+  const result = {}
+  for (const kind of kinds) {
+    if (!LOCAL_AGENT_KINDS.has(kind)) continue
+    if (kind === 'openclaw') {
+      const agent = workspace?.detectedAgents?.find(item => item.kind === kind)
+      if (!agent?.executable) continue
+      try {
+        const runtime = await resolveNativeOpenClawRuntime({ executable: agent.executable,
+          env: nativeConfigEnvironment(kind, workspace?.state.agentPreferences, captured.env), home: captured.home })
+        result[kind] = nativeEnvironmentIdentity({ runtime: JSON.stringify(runtime),
+          ...networkEnvironment(captured.env) })
+      } catch { /* Fail closed for this Agent without blocking other kinds. */ }
+      continue
+    }
+    const keys = nativeDeclaredCredentialKeys(kind, captured)
+    const env = nativeConfigEnvironment(kind, workspace?.state.agentPreferences, captured.env)
+    const authFiles = [...new Set([...nativeAuthIdentityFiles(kind, env, captured.home),
+      ...nativeNetworkIdentityFiles(env)])]
+    const agent = { kind, [NATIVE_AUTH_IDENTITY_FILES]: authFiles }
+    const environmentIdentity = nativeEnvironmentIdentity({
+      ...(env.PATH ? { PATH: env.PATH } : {}),
+      ...networkEnvironment(env), ...configDirectoryEnvironment(env),
+      ...nativeCredentialEnvironment(kind, env, keys),
+      nativeAuthFiles: agentVerificationIdentity(agent),
+    })
+    const projectPaths = nativeProjectConfigPaths(kind, env)
+    if (projectPaths.length) {
+      agent[NATIVE_PROJECT_CONFIG_PATHS] = projectPaths
+      result[kind] = projectVerificationIdentity(kind, workdir, agent, environmentIdentity)
+    } else {
+      result[kind] = environmentIdentity
+    }
+  }
+  return result
+}
+
+function workspaceStoragePath(userData = app.getPath('userData')) {
+  return path.join(userData, 'meldwork-workspace.json')
+}
+
+function notifyWorkspaceChanged(snapshot) {
+  if (mainWindow && !mainWindow.isDestroyed()
+      && isTrustedLocalWebContents(mainWindow.webContents)) {
+    mainWindow.webContents.send('local-workspace:changed', snapshot)
+  }
+}
+
+function rememberKnowledgeBaseSources(sources) {
+  for (const source of Array.isArray(sources) ? sources : []) {
+    const kind = String(source?.kind || '')
+    if (kind) knowledgeBaseSourcesCache.set(kind, source)
+  }
+  return sources
+}
+
+async function loadKnowledgeBaseSources(kind = '') {
+  const selectedKind = String(kind || '').trim()
+  if (knowledgeBaseStatusPromise) {
+    const shared = await knowledgeBaseStatusPromise
+    if (!selectedKind || shared.some(source => source?.kind === selectedKind)) return shared
+  }
+  const request = Promise.resolve().then(async () => resolveKnowledgeBaseSources({
+    env: (await nativeShellEnvironment()).env,
+    store: knowledgeBaseStore,
+    home: app.getPath('home'),
+    kind: selectedKind,
+  })).then(rememberKnowledgeBaseSources)
+  knowledgeBaseStatusPromise = request
+  try {
+    return await request
+  } finally {
+    if (knowledgeBaseStatusPromise === request) knowledgeBaseStatusPromise = null
+  }
+}
+
+async function validateKnowledgeBaseSelections(targetKinds, selections) {
+  const targets = [...new Set((Array.isArray(targetKinds) ? targetKinds : [])
+    .map(kind => String(kind || ''))
+    .filter(isLocalAgentKind))]
+  const requested = Array.isArray(selections) ? selections : []
+  if (!requested.length) return []
+  if (!targets.length) throw new Error('LOCAL_KNOWLEDGE_BASE_SELECTION_INVALID')
+  const genericKinds = [...new Set(requested
+    .filter(source => !source?.selectionId)
+    .map(source => String(source?.kind || '')))]
+  if (genericKinds.some(kind => !knowledgeBaseSourcesCache.has(kind))) {
+    await loadKnowledgeBaseSources()
+  }
+  return Promise.all(requested.map(async (selection) => {
+    const selectionTargets = [...new Set((Array.isArray(selection?.targetKinds) ? selection.targetKinds : [])
+      .map(kind => String(kind || ''))
+      .filter(kind => targets.includes(kind)))]
+    if (!selectionTargets.length
+        || selectionTargets.length !== new Set(selection?.targetKinds || []).size) {
+      throw new Error('LOCAL_KNOWLEDGE_BASE_SELECTION_INVALID')
+    }
+    const selectionId = String(selection?.selectionId || '')
+    if (selectionId) {
+      const keys = Reflect.ownKeys(selection || {})
+      if (!knowledgeConnectors
+          || keys.some(key => !['kind', 'selectionId', 'targetKinds'].includes(key))) {
+        throw new Error('LOCAL_KNOWLEDGE_BASE_SELECTION_INVALID')
+      }
+      try {
+        const preparedSource = await knowledgeConnectors.prepareSelection(selectionId)
+        if (String(selection?.kind || '') !== preparedSource.kind) {
+          throw new Error('LOCAL_KNOWLEDGE_BASE_SELECTION_INVALID')
+        }
+        return knowledgeConnectors.runtimeHint(selectionTargets, preparedSource)
+      } catch {
+        throw new Error('LOCAL_KNOWLEDGE_BASE_SELECTION_INVALID')
+      }
+    }
+    const hint = knowledgeBaseSelectionHint(
+      knowledgeBaseSourcesCache.get(String(selection?.kind || '')),
+      selectionTargets,
+    )
+    if (!hint) throw new Error('LOCAL_KNOWLEDGE_BASE_SELECTION_INVALID')
+    return hint
+  }))
+}
+
+async function runCoreAgent(agent, prompt, workdir, options = {}) {
+  const connectorCredentialIsolation = options.connectorCredentialIsolation === true
+  const connectorInstanceId = options.connectorInstanceId
+  const runOptions = { ...options }
+  delete runOptions.connectorCredentialIsolation
+  delete runOptions.connectorInstanceId
+  delete runOptions.nativeCredentialKeys
+  let connectorConfigEnv = {}
+  if (connectorCredentialIsolation) {
+    if (agent.kind !== 'codex' || !/^custom-[a-f0-9]{16}$/.test(String(connectorInstanceId || ''))) {
+      throw new Error('AGENT_CONNECTOR_CREDENTIAL_ISOLATION_UNSUPPORTED')
+    }
+    const privateRoot = path.join(app.getPath('userData'), 'meldwork-private')
+    const connectorRoot = path.join(privateRoot, 'connector-native')
+    const instanceRoot = path.join(connectorRoot, connectorInstanceId)
+    for (const directory of [privateRoot, connectorRoot, instanceRoot]) ensurePrivateDirectory(directory)
+    connectorConfigEnv = { CODEX_HOME: instanceRoot }
+    for (const [key, name] of [['XDG_CONFIG_HOME', 'config'], ['XDG_DATA_HOME', 'data'],
+      ['XDG_STATE_HOME', 'state'], ['XDG_CACHE_HOME', 'cache'], ['XDG_RUNTIME_DIR', 'runtime']]) {
+      const directory = path.join(instanceRoot, name)
+      ensurePrivateDirectory(directory)
+      connectorConfigEnv[key] = directory
+    }
+  }
+  const shellEnvironment = connectorCredentialIsolation ? null : await nativeShellEnvironment({ workdir })
+  const nativeKeys = connectorCredentialIsolation ? ['CODEX_API_KEY']
+    : nativeDeclaredCredentialKeys(agent.kind, shellEnvironment)
+  if (!connectorCredentialIsolation) {
+    const directory = workspace?.state.agentPreferences?.[agent.kind]?.nativeConfigDirectory
+    if (directory) validateNativeConfigDirectory(agent.kind, directory)
+  }
+  const selectedNativeEnv = shellEnvironment
+    ? nativeConfigEnvironment(agent.kind, workspace?.state.agentPreferences, shellEnvironment.env) : null
+  // OpenClaw runs through its isolated native runtime scope; every other Agent
+  // CLI uses its own native credentials.
+  const nativeRuntime = !connectorCredentialIsolation && agent.kind === 'openclaw'
+    ? await resolveNativeOpenClawRuntime({
+        executable: agent.executable,
+        env: selectedNativeEnv,
+        home: shellEnvironment.home,
+      })
+    : null
+  const injected = connectorCredentialIsolation || agent.kind !== 'openclaw' || !nativeRuntime
+    ? {}
+    : nativeOpenClawOptions({
+        storageRoot: app.getPath('userData'),
+        workdir,
+        sessionRef: runOptions.sessionRef,
+        allowWrite: runOptions.sandbox === 'workspace-write',
+        runtime: nativeRuntime,
+        openclawVersion: agent.version,
+      })
+  const nativeEnv = connectorCredentialIsolation || agent.kind === 'openclaw'
+    ? {}
+    : {
+        ...configDirectoryEnvironment(selectedNativeEnv),
+        ...nativeCredentialEnvironment(agent.kind, selectedNativeEnv, nativeKeys),
+        ...(agent.kind === 'workbuddy' ? workBuddyEnvironment({
+          env: selectedNativeEnv, home: shellEnvironment.home,
+          modelId: workspace?.state.agentPreferences.workbuddy?.modelId,
+        }) : {}),
+        ...(shellEnvironment.env.PATH ? { PATH: shellEnvironment.env.PATH } : {}),
+      }
+  const callerEnv = connectorCredentialIsolation || agent.kind !== 'openclaw'
+    ? runOptions.env
+    : {}
+  return runAgent(agent, prompt, workdir, {
+    ...runOptions,
+    ...(shellEnvironment?.unsetKeys ? { nativeUnsetKeys: shellEnvironment.unsetKeys } : {}),
+    nativeCredentialKeys: nativeKeys,
+    ...injected,
+    env: {
+      ...networkEnvironment(shellEnvironment?.env),
+      ...nativeEnv, ...callerEnv,
+      ...(connectorCredentialIsolation ? {} : nativeConfigEnvironment(agent.kind, workspace?.state.agentPreferences)),
+      ...injected.env,
+      ...connectorConfigEnv,
+    },
+  })
+}
+
+function localAttachmentSupport(kind) {
+  if (customAgentStore?.has(kind)) {
+    return { image: 32, audio: 32, video: 32, file: 32 }
+  }
+  const connectorSupport = agentConnectors?.attachmentSupport(kind)
+  if (connectorSupport) return connectorSupport
+  return {
+    image: imageAttachmentLimit(kind),
+    file: kind === 'opencodereview' ? 0 : 32,
+  }
+}
+
+async function requestLocalSkillTrust({ binding, coordinates, manifest }) {
+  const locale = String(app.getLocale?.() || '').toLowerCase()
+  const compatibility = manifest.agents.map(agent => (
+    `${agent.kind} ${agent.minVersion} - ${agent.maxVersion}`
+  )).join(', ')
+  const credentials = manifest.credentials.map(item => (
+    `${item.credentialId} (${item.type})`
+  )).join(', ') || (locale.startsWith('zh') ? '无' : 'None')
+  const destinations = manifest.networkDestinations.join(', ')
+    || (locale.startsWith('zh') ? '无' : 'None')
+  const tools = manifest.tools.join(', ') || (locale.startsWith('zh') ? '无' : 'None')
+  const detail = locale.startsWith('zh')
+    ? [
+        `Skill：${coordinates.name} (${manifest.identity.id} ${manifest.identity.version})`,
+        `来源：${manifest.origin.type} / ${manifest.origin.publisher}`,
+        `适配 Agent：${compatibility}`,
+        `输入类型：${manifest.inputTypes.join(', ')}`,
+        `工具：${tools}`,
+        `权限：${manifest.permissionMode}`,
+        `凭据：${credentials}`,
+        `外联目标：${destinations}`,
+        `副作用等级：${manifest.sideEffectClass}`,
+        `清单哈希：${binding.contractHash}`,
+        `内容哈希：${binding.contentHash}`,
+      ].join('\n')
+    : [
+        `Skill: ${coordinates.name} (${manifest.identity.id} ${manifest.identity.version})`,
+        `Origin: ${manifest.origin.type} / ${manifest.origin.publisher}`,
+        `Compatible Agents: ${compatibility}`,
+        `Input types: ${manifest.inputTypes.join(', ')}`,
+        `Tools: ${tools}`,
+        `Permission: ${manifest.permissionMode}`,
+        `Credentials: ${credentials}`,
+        `Network destinations: ${destinations}`,
+        `Side-effect class: ${manifest.sideEffectClass}`,
+        `Manifest hash: ${binding.contractHash}`,
+        `Content hash: ${binding.contentHash}`,
+      ].join('\n')
+  const decision = await dialog.showMessageBox(mainWindow, {
+    type: 'warning',
+    title: locale.startsWith('zh') ? '批准本地 Skill' : 'Approve Local Skill',
+    message: locale.startsWith('zh')
+      ? '这是未签名的本地 Skill。仅在确认来源和权限范围后批准。'
+      : 'This is an unsigned local Skill. Approve only after verifying its origin and permissions.',
+    detail,
+    buttons: locale.startsWith('zh') ? ['批准', '取消'] : ['Approve', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  })
+  return decision.response === 0
+}
+
+function createWorkspace() {
+  cloudAgentStartRetry?.cancel()
+  const privateRoot = path.join(app.getPath('userData'), 'meldwork-private')
+  ensurePrivateDirectory(privateRoot)
+  const contentBlobStore = new ContentBlobStore({
+    rootPath: path.join(privateRoot, 'content-blobs'),
+  })
+  const skillSnapshotStore = new LocalSkillSnapshotStore({
+    contentBlobStore,
+    rootPath: path.join(privateRoot, 'skill-snapshots'),
+  })
+  skillTrustStore = new LocalSkillTrustStore({
+    storagePath: path.join(privateRoot, 'skill-trust-audit.jsonl'),
+  })
+  const skillSnapshotSelections = new LocalSkillSnapshotSelections({
+    catalog: skillCatalog,
+    snapshotStore: skillSnapshotStore,
+    contentBlobStore,
+    trustStore: skillTrustStore,
+    requestTrust: requestLocalSkillTrust,
+  })
+  knowledgeConnectors = new LocalKnowledgeConnectors({
+    contentBlobStore,
+    getObsidianVaultPath: () => knowledgeBaseStore?.state().obsidianVaultPath || '',
+    storagePath: path.join(privateRoot, 'knowledge-connector-records.json'),
+  })
+  agentConnectors = new LocalAgentConnectors({
+    manifestDirectory: path.join(app.getPath('userData'), 'agent-connectors', 'manifests'),
+    packageStore: new AgentConnectorPackageStore({
+      rootPath: path.join(privateRoot, 'agent-connector-packages'),
+    }),
+    instanceStore: new AgentConnectorInstanceStore({
+      instanceStoragePath: path.join(app.getPath('userData'), 'agent-connectors', 'instances.json'),
+      credentialStoragePath: path.join(privateRoot, 'agent-connector-credentials.json'),
+      safeStorage: lazySafeStorage,
+    }),
+    runAgent: runCoreAgent,
+    cloudBridges: cloudAgentBridges,
+  })
+  const outcomeStore = new OutcomeStore({
+    rootPath: path.join(privateRoot, 'outcomes'),
+    contentBlobStore,
+  })
+  const runLedger = new RunLedger({
+    storagePath: path.join(app.getPath('userData'), 'meldwork-run-ledger.json'),
+  })
+  const runtime = new CloudAgentRuntime({
+    runLedger,
+    outcomeStore,
+    contentBlobStore,
+    operationStore: new CloudAgentOperationStore({
+      storagePath: path.join(privateRoot, 'cloud-agent-operations.json'),
+    }),
+    connectors: [],
+  })
+  cloudAgentRuntime = runtime
+  channelIngressRuntime = new ChannelIngressRuntime({
+    store: new ChannelInboxStore({
+      storagePath: path.join(privateRoot, 'channel-inbox.json'),
+    }),
+    connectors: [],
+  })
+  const localWorkspace = new LocalWorkspace({
+    storagePath: workspaceStoragePath(),
+    contentBlobStore,
+    contextPackStore: new ContextPackStore({
+      rootPath: path.join(privateRoot, 'context-packs'),
+    }),
+    outcomeStore,
+    agentFitMatrix: FROZEN_AGENT_FIT_MATRIX,
+    resolveProjectEnvironmentIdentities,
+    runLedger: cloudAgentRuntime.workspaceLedger(),
+    detectAgents: async () => {
+      await cloudAgentBridges?.refresh()
+      const [installedAgents, customAgents] = await Promise.all([
+        installer.detectedAgents(),
+        customAgentStore.detectAgents(),
+      ])
+      return [
+        ...installedAgents,
+        ...customAgents,
+        ...agentConnectors.refresh(installedAgents),
+      ]
+    },
+    resolveAttachments: input => attachments.availableStore().resolve(input),
+    captureAgentOutputs: workdir => captureAgentOutputState(workdir),
+    captureArtifactOutputs: (workdir, options) => captureArtifactOutputState(workdir, options),
+    captureAgentOutcomeDescriptors,
+    importAgentOutputs: input => importAgentOutputs(input, attachments.availableStore()),
+    validateSkillSelections: async (kind, selections) => {
+      if (selections?.length) await nativeShellEnvironment()
+      return skillSnapshotSelections.prepare(kind, selections)
+    },
+    validateKnowledgeBaseSelections,
+    imageAttachmentLimit,
+    attachmentSupport: localAttachmentSupport,
+    credentialState: async (kind, agent) => {
+      if (customAgentStore.has(kind)) return { state: 'ready', source: 'custom-agent' }
+      if (agentConnectors.has(kind)) return { state: 'ready', source: 'agent-connector' }
+      const shellEnvironment = await nativeShellEnvironment()
+      const directory = workspace?.state.agentPreferences?.[kind]?.nativeConfigDirectory
+      if (directory) {
+        try { validateNativeConfigDirectory(kind, directory) } catch {
+          return { state: 'unknown', source: 'native-runtime-unavailable' }
+        }
+      }
+      return resolveNativeCredentialState(kind, {
+        executable: agent?.executable,
+        env: nativeConfigEnvironment(kind, workspace?.state.agentPreferences, shellEnvironment.env),
+        home: shellEnvironment.home,
+        credentialSource: shellEnvironment.source,
+        nativeCredentialKeys: nativeDeclaredCredentialKeys(kind, shellEnvironment),
+        ...(kind === 'workbuddy' ? { modelId: workspace?.state.agentPreferences.workbuddy?.modelId } : {}),
+      })
+    },
+    agentLabel: kind => customAgentStore.label(kind) || agentConnectors.label(kind),
+    isKnownAgent: kind => cloudAgentBridges.catalogEntries().some(agent => agent.kind === kind),
+    connectorRuntime: agentConnectors,
+    naturalAgentResponses: true,
+    runAgent: async (agent, prompt, workdir, options = {}) => {
+      if (customAgentStore.has(agent.kind)) {
+        return customAgentStore.run(agent.kind, prompt, workdir, {
+          sandbox: options.sandbox,
+          signal: options.signal,
+          onActivity: options.onActivity,
+          onProgress: options.onProgress,
+          onEvent: options.onEvent,
+          onOutboundPayload: options.onOutboundPayload,
+          attachments: options.attachments,
+        })
+      }
+      return runCoreAgent(agent, prompt, workdir, options)
+    },
+  })
+  cloudAgentStartRetry = createCloudAgentStartRetry({
+    runtime,
+    isActive: candidate => !shutdownStarted && cloudAgentRuntime === candidate,
+  })
+  cloudAgentStartRetry.start()
+  channelIngressRuntime.start().catch(() => {})
+  return localWorkspace
+}
+
+async function localAgentCatalog() {
+  await cloudAgentBridges?.refresh()
+  const [catalog, customAgents, installedAgents] = await Promise.all([
+    installer.catalog(),
+    customAgentStore.catalog(),
+    installer.detectedAgents(),
+  ])
+  agentConnectors?.refresh(installedAgents)
+  const connectorAgents = agentConnectors?.catalog() || []
+  const mergedAgents = new Map()
+  for (const agent of [...catalog.agents, ...customAgents, ...connectorAgents]) {
+    mergedAgents.set(agent.kind, agent)
+  }
+  for (const agent of cloudAgentBridges?.catalogEntries?.() || []) {
+    mergedAgents.set(agent.kind, { ...(mergedAgents.get(agent.kind) || {}), ...agent })
+  }
+  const states = new Map((workspace?.snapshot().agents || []).map(agent => [agent.kind, agent]))
+  return {
+    ...catalog,
+    agents: [...mergedAgents.values()].map((agent) => {
+      const state = states.get(agent.kind)
+      const support = localAttachmentSupport(agent.kind)
+      return {
+        ...agent,
+        versionIdentified: Boolean(agent.installed && (state?.versionIdentified
+          ?? agent.versionIdentified ?? agent.resolvedVersion)),
+        compatible: Boolean(agent.installed && (state?.compatible
+          ?? agent.compatible ?? agent.compatibilityState === 'compatible')),
+        configured: Boolean(agent.installed && state?.configured),
+        authenticated: Boolean(agent.installed && state?.authenticated),
+        invocable: Boolean(agent.installed && state?.invocable),
+        recentlyVerified: Boolean(agent.installed && state?.recentlyVerified),
+        capabilities: state?.capabilities || agent.capabilities || null,
+        available: Boolean(agent.installed && state?.invocable),
+        credentialState: agent.installed
+          ? (state?.credentialState || agent.credentialState || 'unknown')
+          : 'missing',
+        availabilitySource: agent.installed ? (state?.availabilitySource || agent.availabilitySource || 'unverified') : 'none',
+        showInSidebar: Boolean(agent.installed && (state?.showInSidebar
+          ?? (agent.cloud ? workspace?.state?.agentPreferences?.[agent.kind]?.showInSidebar ?? true : false))),
+        attachmentTypes: Object.entries(support)
+          .filter(([, limit]) => Number(limit) > 0)
+          .map(([type]) => type),
+      }
+    }),
+  }
+}
+
+async function refreshLocalAgentState() {
+  const target = workspace
+  if (!target) return null
+  const task = localAgentRefreshQueue.then(async () => {
+    if (workspace !== target) return workspace?.snapshot() || null
+    await nativeShellEnvironment({ refresh: true })
+    const snapshot = await target.refreshAgents()
+    if (workspace !== target) return workspace?.snapshot() || null
+    return snapshot
+  })
+  localAgentRefreshQueue = task.catch(() => {})
+  return task
+}
+
+function initializeWorkspace() {
+  if (workspace) return workspace
+  const next = createWorkspace()
+  workspace = next
+  workspaceChangedListener = notifyWorkspaceChanged
+  workspaceRunFinishedListener = notifyRunFinished
+  workspaceRunEventListener = notifyWorkspaceRunEvent
+  next.on('changed', workspaceChangedListener)
+  next.on('run-finished', workspaceRunFinishedListener)
+  next.on('run-event', workspaceRunEventListener)
+  return next
+}
+
+function createWindow(startupError = workspaceStartupError) {
+  mainWindow = new BrowserWindow({
+    width: 1440,
+    height: 920,
+    minWidth: 980,
+    minHeight: 680,
+    title: 'multiwork',
+    icon: appIconImage() || appIconPath(),
+    backgroundColor: process.platform === 'darwin' ? '#e7edef' : '#f3f6f8',
+    ...(process.platform === 'darwin' ? {
+      titleBarStyle: 'hiddenInset',
+      trafficLightPosition: { x: 18, y: 16 },
+    } : {}),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+    },
+  })
+  mainWindow.webContents.session.setPermissionCheckHandler?.(() => false)
+  mainWindow.webContents.session.setPermissionRequestHandler?.((
+    _webContents, _permission, callback,
+  ) => callback(false))
+  mainWindow.webContents.session.setDevicePermissionHandler?.(() => false)
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    openExternalUrl(url)
+    return { action: 'deny' }
+  })
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (isAllowedLocalNavigation(url)) return
+    event.preventDefault()
+    openExternalUrl(url)
+  })
+  mainWindow.webContents.on('did-fail-load', (
+    _event, errorCode, _errorDescription, validatedUrl, isMainFrame,
+  ) => {
+    if (!isMainFrame || errorCode === -3) return
+    try {
+      if (new URL(validatedUrl).pathname.endsWith('/offline.html')) return
+    } catch { /* invalid URLs fall through to the offline page */ }
+    showOfflinePage(errorCode)
+  })
+  mainWindow.webContents.on('did-finish-load', flushPendingOpenGroup)
+  // A crashed renderer used to leave a blank window; reload it so the
+  // workspace (whose state lives in the main process) comes back.
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    recordMainProcessFault('render-process-gone', details?.reason || 'unknown')
+    if (details?.reason !== 'clean-exit' && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.reload()
+    }
+  })
+  mainWindow.on('closed', () => {
+    mainWindow = null
+  })
+  if (startupError) showOfflinePage(startupError)
+  else {
+    loadFrontend()
+    flushPendingOpenGroup()
+  }
+  return mainWindow
+}
+
+const {
+  activateMainWindow,
+  flushPendingOpenGroup,
+  notifyRunFinished,
+  notifyWorkspaceRunEvent,
+} = createRunNotificationCoordinator({
+  Notification,
+  app,
+  appIconImage,
+  appIconPath,
+  createWindow,
+  getMainWindow: () => mainWindow,
+  isLocalAgentKind,
+  isShutdownStarted: () => shutdownStarted,
+  isTrustedLocalWebContents,
+  normalizeRunEvent,
+})
+
+function registerIpc() {
+  registerDesktopIpc({
+    app,
+    attachmentIdsFromSnapshot,
+    attachments,
+    customAgentStore,
+    dialog,
+    getAttachmentStore: () => attachmentStore,
+    getAgentConnectors: () => agentConnectors,
+    getCloudAgentRuntime: () => cloudAgentRuntime,
+    getCloudAgentBridges: () => cloudAgentBridges,
+    getMainWindow: () => mainWindow,
+    getWorkspace: () => workspace,
+    getNativeConfigSummary: async (kind, currentWorkspace) => {
+      if (!['hermes', 'codex', 'qwen', 'zcode', 'deepseek'].includes(kind)) return null
+      const shell = await nativeShellEnvironment()
+      const env = nativeConfigEnvironment(kind, currentWorkspace.state.agentPreferences, shell.env)
+      if (kind === 'deepseek') return { provider: deepseekNativeConfig({ home: shell.home, env }).explicitModel ? '' : 'zgci' }
+      if (kind === 'qwen' || kind === 'zcode') return nativeUserConfigSummary(kind, { home: shell.home, env })
+      return { provider: kind === 'hermes'
+        ? hermesConfiguredProvider({ home: shell.home, env })
+        : codexConfiguredProvider({ home: shell.home, env }) }
+    },
+    getWorkBuddySettings: async () => {
+      const shell = await nativeShellEnvironment()
+      return workBuddySettings({ ...shell,
+        env: nativeConfigEnvironment('workbuddy', workspace?.state.agentPreferences, shell.env),
+        modelId: workspace?.state.agentPreferences.workbuddy?.modelId })
+    },
+    installer,
+    isShutdownStarted: () => shutdownStarted,
+    knowledgeBaseStore,
+    getKnowledgeConnectors: () => knowledgeConnectors,
+    knowledgeBaseGuideUrl,
+    loadKnowledgeBaseSources,
+    knowledgeInstallEnvironment: nativeShellEnvironment,
+    knowledgeInstallSignal: knowledgeInstallShutdown.signal,
+    localAgentCatalog,
+    openExternalUrl,
+    getOutcomeStore: () => workspace?.outcomeStore,
+    getSkillTrustStore: () => skillTrustStore,
+    refreshLocalAgentState,
+    registerTrustedHandle,
+    resolveConnectorEnvironment: async names => (await resolveNativeShellEnvironment({
+      home: app.getPath('home'), extraEnvKeys: names, refresh: true,
+    })).env,
+    skillCatalog,
+  })
+}
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+
+if (!hasSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', activateMainWindow)
+
+  app.whenReady().then(async () => {
+    try {
+      ensurePrivateDirectory(app.getPath('userData'))
+    } catch (error) {
+      console.error('MELDWORK_PRIVATE_DIRECTORY_UNAVAILABLE', { code: String(error?.code || '') })
+      app.quit()
+      return
+    }
+    try {
+      migrateLegacyProductData(app.getPath('userData'))
+    } catch (error) {
+      console.error(
+        'MELDWORK_PRODUCT_DATA_MIGRATION_ABORTED',
+        error?.diagnostic || { status: 'failed', code: String(error?.code || '') },
+      )
+      app.quit()
+      return
+    }
+    const attachmentReferences = persistedAttachmentReferences(workspaceStoragePath())
+    customAgentStore = new CustomAgentStore({
+      storagePath: path.join(app.getPath('userData'), 'meldwork-custom-agents.json'),
+      environment: async () => (await nativeShellEnvironment()).env,
+    })
+    cloudAgentBridges = new CloudAgentBridgeStore({
+      storagePath: path.join(app.getPath('userData'), 'meldwork-cloud-agent-bridges.json'),
+      fetch: globalThis.fetch,
+    })
+    // The shared Provider store was removed; drop any legacy encrypted
+    // credentials so they do not linger on disk unread.
+    try {
+      const { rmSync } = require('node:fs')
+      rmSync(path.join(app.getPath('userData'), 'meldwork-provider.json'), { force: true })
+    } catch { /* best-effort cleanup */ }
+    knowledgeBaseStore = new KnowledgeBaseStore({
+      storagePath: path.join(app.getPath('userData'), 'meldwork-knowledge-base.json'),
+    })
+    try {
+      attachmentStore = new AttachmentStore({
+        rootPath: path.join(app.getPath('userData'), 'attachments'),
+      })
+    } catch {
+      attachmentStore = null
+    }
+    attachments.registerProtocol(protocol)
+    skillCatalog = new LocalSkillCatalog({
+      home: app.getPath('home'),
+      configDirectoryForKind: kind => {
+        const key = NATIVE_CONFIG_DIRECTORIES[kind]?.key
+        if (!key) return ''
+        let directory = nativeConfigEnvironment(kind, workspace?.state.agentPreferences, nativeSkillDirectories)[key] || ''
+        if (directory === '~' || directory.startsWith('~/') || (process.platform === 'win32' && directory.startsWith('~\\'))) {
+          directory = path.join(app.getPath('home'), directory.slice(2))
+        }
+        if (directory && !path.isAbsolute(directory)) throw new Error('LOCAL_NATIVE_CONFIG_INVALID')
+        return directory
+      },
+      sharedDirectoryForKind: kind => {
+        if (kind === 'opencode') return nativeSkillDirectories.XDG_CONFIG_HOME || ''
+        if (kind !== 'deepseek') return ''
+        let directory = nativeSkillDirectories.DSH_AGENTS_HOME || ''
+        if (!directory.trim()) return ''
+        if (directory === '~' || directory.startsWith('~/') || directory.startsWith('~\\')) {
+          directory = path.join(app.getPath('home'), directory.slice(2))
+        }
+        if (!path.isAbsolute(directory)) throw new Error('LOCAL_NATIVE_CONFIG_INVALID')
+        return directory
+      },
+    })
+    installer = new AgentInstaller({
+      environment: nativeShellEnvironment,
+      detectAgents: detectLocalAgents,
+      listSkills: async kind => {
+        await nativeShellEnvironment()
+        return skillCatalog.list(kind)
+      },
+    })
+    installer.on('changed', state => {
+      if (mainWindow && !mainWindow.isDestroyed()
+          && isTrustedLocalWebContents(mainWindow.webContents)) {
+        mainWindow.webContents.send('local-agent-installer:changed', state)
+      }
+      if (state.phase === 'completed') {
+        refreshLocalAgentState().catch(() => {})
+      }
+    })
+    try {
+      initializeWorkspace()
+    } catch (error) {
+      if (error?.message !== 'RUN_LEDGER_LOAD_FAILED') throw error
+      workspaceStartupError = 'RUN_LEDGER_LOAD_FAILED'
+      createWindow()
+      app.on('activate', () => {
+        if (!shutdownStarted && BrowserWindow.getAllWindows().length === 0) createWindow()
+      })
+      return
+    }
+    if (attachmentStore && attachmentReferences) {
+      try {
+        attachmentStore.cleanup(attachmentReferences)
+      } catch { /* orphan cleanup is best effort; the validated store remains usable */ }
+    }
+    registerIpc()
+    Menu.setApplicationMenu(Menu.buildFromTemplate([
+      { role: 'appMenu' },
+      { role: 'editMenu' },
+      { role: 'viewMenu' },
+      { role: 'windowMenu' },
+    ]))
+    if (process.platform === 'darwin') {
+      const icon = appIconImage()
+      if (icon) app.dock?.setIcon?.(icon)
+    }
+    createWindow()
+    app.on('activate', () => {
+      if (shutdownStarted) return
+      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    })
+  })
+
+  app.on('window-all-closed', () => {
+    let channelReceiverActive = false
+    try {
+      channelReceiverActive = channelIngressRuntime?.status().receiverCount > 0
+    } catch { /* An unavailable optional Channel must not keep the process alive. */ }
+    if (process.platform !== 'darwin' && !channelReceiverActive) app.quit()
+  })
+
+  app.on('before-quit', (event) => {
+    event.preventDefault()
+    if (quitCleanup) return
+    shutdownStarted = true
+    knowledgeInstallShutdown.abort()
+    cloudAgentStartRetry?.cancel()
+    cloudAgentStartRetry = null
+    installer?.cancelPending()
+    const installerState = installer?.state()
+    const installRunning = Boolean(installerState?.canCancel)
+    if (installRunning) installer.cancel(installerState.taskId)
+    quitCleanup = runQuitCleanup([
+      () => channelIngressRuntime?.shutdown(),
+      () => cloudAgentBridges?.close(),
+      () => cloudAgentRuntime?.shutdown(),
+      async () => {
+        try {
+          await workspace?.stopAll()
+        } finally {
+          await shutdownAcpSessionRuntime()
+        }
+      },
+      () => installer?.waitForIdle(),
+    ]).then(() => {
+      app.exit(0)
+    })
+  })
+}
+
+module.exports = {
+  isTrustedLocalRenderer,
+  isTrustedLocalWebContents,
+  runQuitCleanup,
+}
