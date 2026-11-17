@@ -1,349 +1,72 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { readFileSync } = require('node:fs')
+const fs = require('node:fs')
 const path = require('node:path')
 const { JSDOM } = require('../../frontend/node_modules/jsdom')
 
-const root = path.resolve(__dirname, '..')
-const html = readFileSync(path.join(root, 'index.html'), 'utf8')
-const scripts = ['i18n.js', 'glyph-embers.js', 'main.js'].map(file => readFileSync(path.join(root, file), 'utf8'))
-
-test('release metadata, downloads, official logo and commercial licensing stay consistent', () => {
-  const version = require('../../desktop/package.json').version
-  assert.equal(require('../../frontend/package.json').version, version)
-  assert.equal(require('../../desktop/package.json').license, 'Apache-2.0')
-  assert.equal(require('../../frontend/package.json').license, 'Apache-2.0')
-  assert.match(readFileSync(path.join(root, '..', 'LICENSE'), 'utf8'), /Apache License\s+Version 2\.0/)
-  for (const name of ['LICENSE', 'NOTICE', 'COMMERCIAL_USE.md']) {
-    assert.equal(readFileSync(path.join(root, name), 'utf8'), readFileSync(path.join(root, '..', name), 'utf8'))
-  }
-  for (const name of ['README.md', 'README.zh-CN.md', 'COMMERCIAL_USE.md']) {
-    const source = readFileSync(path.join(root, '..', name), 'utf8')
-    assert.match(source, /Apache/)
-    assert.doesNotMatch(source, /Non-Commercial|non-commercial purposes|Commercial use requires prior|禁止商用/)
-  }
-  assert.deepEqual(readFileSync(path.join(root, 'assets/agents/zcode.png')), readFileSync(path.join(root, '../frontend/public/agent-logos/zcode.png')))
-  for (const language of ['en', 'zh-CN']) {
-    const p = page({ language })
-    try {
-      const schema = JSON.parse(p.doc.querySelector('script[type="application/ld+json"]').textContent)['@graph'][0]
-      assert.equal(schema.softwareVersion, version)
-      assert.equal(schema.license, 'https://www.apache.org/licenses/LICENSE-2.0')
-      assert.match(p.doc.querySelector('.foot-meta').textContent, /Commercial use permitted|允许商用/)
-      assert.doesNotMatch(p.doc.body.textContent, /Non-Commercial|non-commercial purposes|Commercial use requires prior|禁止商用/)
-      for (const link of p.doc.querySelectorAll('a[href*="/releases/"]')) {
-        assert.ok(link.href.includes(`https://github.com/xuilen/multiwork/releases/${link.href.includes("/download/") ? "download" : "tag"}/v${version}`), link.href)
-        if (link.href.includes('/download/')) assert.ok(link.href.endsWith(`multiwork-${version}-windows-x64.zip`), link.href)
-      }
-      const logos = [...p.doc.querySelectorAll('.logo-chip img')].map(el => el.getAttribute('src'))
-      assert.ok(logos.indexOf('assets/agents/zcode.png') >= 0)
-      assert.ok(logos.indexOf('assets/agents/zcode.png') < logos.indexOf('assets/agents/pi.svg'))
-    } finally { p.dom.window.close() }
-  }
-})
-
-test('published product page links to its live URL, screenshot and upstream credits', () => {
-  const p = page()
-  try {
-    const { doc } = p
-    assert.equal(doc.querySelector('link[rel=canonical]').href, 'https://xuilen.github.io/multiwork/')
-    const imagePath = doc.querySelector('#product figure img').getAttribute('src')
-    assert.equal(doc.querySelector('#product figure a').getAttribute('href'), imagePath)
-    assert.ok(readFileSync(path.join(root, imagePath)).length > 0)
-    for (const language of ['en', 'zh']) {
-      p.window.meldworkI18n.setLocale(language)
-      assert.ok(doc.querySelector('footer a[href="https://github.com/Ryder-Sun/Meldwork"]'))
-      assert.ok(doc.querySelector('.hero a[href="#product"]'))
-    }
-  } finally { p.dom.window.close() }
-})
-
-function page({ language = 'en', saved, reduced = false, blockedStorage = false } = {}) {
-  const dom = new JSDOM(html, { url: 'https://meldwork.test/', runScripts: 'outside-only', pretendToBeVisual: true })
+const root = path.join(__dirname, '..')
+const read = file => fs.readFileSync(path.join(root, file), 'utf8')
+function page(language = 'zh-CN', blocked = false) {
+  const dom = new JSDOM(read('index.html'), { runScripts: 'outside-only', url: 'https://xuilen.github.io/multiwork/' })
   const { window } = dom
-  const observers = []
-  const timers = new Map()
-  const frames = new Map()
-  const mediaQueries = []
-  let frameId = 0
-  let emberDraws = 0
-  let glyphSamples = []
-  let timerId = 0
   Object.defineProperty(window.navigator, 'language', { value: language })
-  if (saved) window.localStorage.setItem('meldwork-landing-locale', saved)
-  if (blockedStorage) Object.defineProperty(window, 'localStorage', { get() { throw new Error('unavailable') } })
-  window.matchMedia = () => {
-    const query = { matches: reduced, addEventListener(name, callback) { this.onChange = callback } }
-    mediaQueries.push(query)
-    return query
-  }
-  window.requestAnimationFrame = callback => { frames.set(++frameId, callback); return frameId }
-  window.cancelAnimationFrame = id => frames.delete(id)
-  window.setTimeout = (callback, delay) => { timers.set(++timerId, { callback, delay }); return timerId }
-  window.clearTimeout = id => timers.delete(id)
-  window.setInterval = window.setTimeout
-  window.clearInterval = window.clearTimeout
-  window.HTMLCanvasElement.prototype.getContext = function () {
-    const canvas = this
-    return { scale() {}, setTransform() {}, drawImage() {}, fillRect() {},
-      createRadialGradient() { return { addColorStop() {} } },
-      clearRect() { if (!canvas.id) glyphSamples = [] }, beginPath() {}, arc() {}, fill() {},
-      fillText(glyph, x, y) {
-        if (canvas.id !== 'bgCanvas') emberDraws++
-        if (!canvas.id) glyphSamples.push({ glyph, x, y, color: this.fillStyle })
-      } }
-  }
-  window.HTMLMediaElement.prototype.pause = () => {}
-  window.IntersectionObserver = class {
-    constructor(callback) { this.callback = callback; this.targets = []; observers.push(this) }
-    observe(target) { this.targets.push(target) }
-    unobserve() {}
-    disconnect() {}
-  }
-  window.ResizeObserver = class { observe() {} }
-  scripts.forEach(source => window.eval(source))
+  if (blocked) Object.defineProperty(window, 'localStorage', { get() { throw Error('Unavailable') } })
+  for (const file of ['i18n.js', 'main.js']) window.eval(read(file))
   const doc = window.document
-  const scenario = doc.querySelector('[data-scenario]')
-  function inView(value) {
-    const observer = observers.findLast(entry => entry.targets.includes(scenario))
-    observer.callback([{ target: scenario, isIntersecting: value }])
-  }
-  function pulse() {
-    const timer = [...timers.entries()].find(([, value]) => value.delay === 35) ||
-      [...timers.entries()].find(([, value]) => [1300, 1600, 1800, 4200].includes(value.delay))
-    assert.ok(timer, 'a playback timer should exist')
-    timers.delete(timer[0])
-    timer[1].callback()
-  }
-  function tick() {
-    const initial = scenario.querySelector('[aria-current="step"]').dataset.step
-    let guard = 0
-    do { pulse(); assert.ok(++guard < 300) } while (scenario.querySelector('[aria-current="step"]').dataset.step === initial)
-  }
-  function runFrame(now) {
-    const pending = [...frames.values()]
-    frames.clear()
-    pending.forEach(callback => callback(now))
-  }
-  function setMotion(value) {
-    mediaQueries.forEach(query => { query.matches = value; query.onChange?.() })
-  }
-  return { dom, window, doc, scenario, inView, tick, pulse, timers, runFrame, setMotion,
-    emberDraws: () => emberDraws, glyphSamples: () => glyphSamples }
+  return { doc, dom, value: id => doc.getElementById(id).textContent, pick: agent => doc.querySelector('[data-agent="' + agent + '"]').click() }
 }
 
-test('browser language, saved preference, repeated switching and metadata stay synchronized', () => {
-  const p = page({ language: 'zh-CN' })
+test('release download, credit, license copies and local site assets match the distribution', () => {
+  const { doc, dom } = page()
   try {
-    assert.equal(p.doc.documentElement.lang, 'zh-CN')
-    assert.match(p.doc.querySelector('h1').textContent, /提出目标/)
-    assert.match(p.doc.title, /协作完成/)
-    assert.equal(p.doc.querySelector('[data-pause]').textContent, '暂停播放')
-    const toggle = p.doc.getElementById('languageToggle')
-    toggle.click()
-    assert.equal(p.doc.documentElement.lang, 'en')
-    assert.equal(p.window.localStorage.getItem('meldwork-landing-locale'), 'en')
-    assert.match(p.doc.querySelector('h1').textContent, /Set the Goal/)
-    toggle.click()
-    toggle.click()
-    toggle.click()
-    assert.equal(p.doc.querySelectorAll('#headline .hl-line').length, 2)
-    assert.match(p.doc.querySelector('a[href*="README.zh-CN.md"]').textContent, /中文/)
-    assert.equal(p.doc.querySelector('[data-next]').getAttribute('aria-label'), '下一步')
-    const faq = JSON.parse(p.doc.querySelector('script[type="application/ld+json"]').textContent)['@graph'][1]
-    assert.ok(faq.mainEntity.some(item => item.name === '我还需要介入吗？'))
-    const savedPage = page({ language: 'zh', saved: 'en' })
-    assert.equal(savedPage.doc.documentElement.lang, 'en')
-    savedPage.dom.window.close()
-  } finally { p.dom.window.close() }
-})
-
-test('unavailable storage still permits language switching', () => {
-  const p = page({ blockedStorage: true, language: 'zh' })
-  try {
-    p.doc.getElementById('languageToggle').click()
-    assert.equal(p.doc.documentElement.lang, 'en')
-  } finally { p.dom.window.close() }
-})
-
-test('full-page copy has Chinese alternatives while links and emphasis survive switching', () => {
-  const p = page()
-  try {
-    for (const el of p.doc.querySelectorAll('h1 .hl-line,h2,h3,p:not([data-run-status]),.cta-ghost,.nav-link span,.m-link span,.stat-label,.meta-pill,.meta-name,.seg-btn,.t-time,.t-role,.cs-caption,.cmp-row > div,.bnd-col li,.acc-trigger > span:first-child,.foot-meta > span')) {
-      assert.ok(el.hasAttribute('data-zh') || el.closest('[data-zh]'), el.outerHTML)
+    const version = require('../../desktop/package.json').version
+    assert.equal(version, require('../../frontend/package.json').version)
+    assert.equal(doc.querySelector('.primary').href, 'https://github.com/xuilen/multiwork/releases/download/v' + version + '/multiwork-' + version + '-windows-x64.zip')
+    assert.equal(doc.querySelector('link[rel=canonical]').href, 'https://xuilen.github.io/multiwork/')
+    assert.ok(doc.querySelector('footer a[href="https://github.com/Ryder-Sun/Meldwork"]'))
+    for (const name of ['LICENSE', 'NOTICE', 'COMMERCIAL_USE.md']) assert.equal(read(name), read('../' + name))
+    for (const el of doc.querySelectorAll('[src],link[rel=stylesheet],link[rel=icon]')) {
+      const src = (el.getAttribute('src') || el.getAttribute('href')).split('?')[0]
+      assert.ok(fs.existsSync(path.join(root, src)), src)
     }
-    const linkCount = p.doc.querySelectorAll('a').length
-    p.window.meldworkI18n.setLocale('zh')
-    assert.equal(p.doc.querySelectorAll('a').length, linkCount)
-    assert.ok(p.doc.querySelector('.t-bubble p strong'))
-    p.doc.querySelector('.acc-trigger').click()
-    assert.equal(p.doc.querySelector('.acc-trigger').getAttribute('aria-expanded'), 'true')
-  } finally { p.dom.window.close() }
+    for (const a of doc.querySelectorAll('a[href^="#"]')) assert.ok(doc.getElementById(a.hash.slice(1)))
+  } finally { dom.window.close() }
 })
 
-test('manual playback pauses and language switches preserve the current contribution', () => {
-  const p = page()
+test('sample replies add up, switches clear stale details and unavailable usage stays unknown', () => {
+  const { doc, dom, value, pick } = page()
   try {
-    p.inView(true)
-    assert.equal(p.scenario.dataset.playback, 'playing')
-    p.tick()
-    assert.equal(p.scenario.querySelector('[aria-current="step"]').dataset.step, '1')
-    p.doc.querySelector('[data-next]').click()
-    assert.equal(p.scenario.dataset.playback, 'paused')
-    p.window.meldworkI18n.setLocale('zh')
-    assert.equal(p.scenario.querySelector('[aria-current="step"]').dataset.step, '2')
-    assert.equal(p.doc.querySelector('[data-round]').textContent, '第 1 轮 · 分析')
-    assert.equal(p.doc.querySelector('[data-pause]').textContent, '继续播放')
-    p.doc.querySelector('[data-pause]').click()
-    assert.equal(p.scenario.dataset.playback, 'playing')
-    p.inView(false)
-    assert.equal(p.scenario.dataset.playback, 'paused')
-  } finally { p.dom.window.close() }
+    assert.equal(value('total'), '12,840')
+    assert.equal(value('input'), '10,240')
+    assert.equal(value('output'), '2,600')
+    assert.equal(value('quota'), '72%')
+    assert.equal(doc.querySelectorAll('.bar').length, 8)
+    pick('claude')
+    assert.equal(value('total'), '10,330')
+    assert.equal(value('quota'), '本例未报告')
+    assert.equal(doc.querySelector('[aria-pressed="true"][data-agent]').dataset.agent, 'claude')
+    pick('gemini')
+    for (const id of ['total','input','output']) assert.equal(value(id), '—')
+    assert.equal(doc.querySelectorAll('.bar').length, 0)
+    pick('codex')
+    assert.equal(value('quota'), '72%')
+    assert.equal(doc.querySelectorAll('.bar').length, 8)
+  } finally { dom.window.close() }
 })
 
-test('autoplay types each contribution and loops after the synthesis', () => {
-  const p = page()
+test('language and color controls work without storage and keep the selected sample', () => {
+  const { doc, dom, value, pick } = page('en-US', true)
   try {
-    p.inView(true)
-    const first = p.scenario.querySelector('[data-step="0"] p')
-    assert.equal(first.textContent, '')
-    p.pulse()
-    assert.ok(first.textContent.length > 0 && first.textContent.length < 20)
-    for (let i = 0; i < 4; i++) p.tick()
-    assert.equal(p.doc.querySelector('[data-status]').textContent, '5 / 5')
-    assert.equal(p.scenario.dataset.playback, 'playing')
-    p.tick()
-    assert.equal(p.doc.querySelector('[data-status]').textContent, '1 / 5')
-    assert.equal(first.textContent, '')
-  } finally { p.dom.window.close() }
-})
-
-test('mentions precede thinking and both Agents respond in order', () => {
-  const p = page()
-  try {
-    p.inView(true)
-    const steps = [...p.scenario.querySelectorAll('.t-step')]
-    const seats = [...p.scenario.querySelectorAll('[data-agent]')]
-    p.tick()
-    assert.deepEqual(seats.map(seat => seat.dataset.state), ['working', 'waiting', 'waiting'])
-    assert.equal(steps[1].querySelector('p').textContent, '')
-    while (p.scenario.dataset.phase === 'typing') p.pulse()
-    assert.match(steps[1].textContent, /@Hermes/)
-    assert.match(steps[1].textContent, /@OpenCodeReview/)
-    assert.deepEqual(seats.map(seat => seat.dataset.state), ['waiting', 'thinking', 'thinking'])
-    p.pulse()
-    assert.deepEqual(seats.map(seat => seat.dataset.state), ['waiting', 'working', 'working'])
-    p.tick()
-    assert.deepEqual(steps.map(step => step.hidden), [false, false, false, true, true])
-    assert.match(steps[2].textContent, /Hermes/)
-    p.tick()
-    assert.deepEqual(seats.map(seat => seat.dataset.state), ['waiting', 'done', 'working'])
-    assert.match(steps[3].textContent, /OpenCodeReview/)
-    p.doc.querySelector('[data-mode="order"]').click()
-    assert.ok(steps.every(step => !step.hidden))
-    p.window.meldworkI18n.setLocale('zh')
-    assert.match(steps[1].textContent, /@Hermes/)
-    assert.doesNotMatch(p.doc.body.textContent, /自动讨论\s*V4|Auto Discussion\s*V4/)
-    assert.equal(p.doc.querySelector('#capabilities'), null)
-    assert.equal(p.doc.querySelector('a[href="#capabilities"]'), null)
-  } finally { p.dom.window.close() }
-})
-
-test('hover keeps playback running while document visibility suspends it', () => {
-  const p = page()
-  try {
-    p.inView(true)
-    p.tick()
-    p.scenario.dispatchEvent(new p.window.MouseEvent('mouseenter'))
-    assert.equal(p.scenario.dataset.playback, 'playing')
-    p.scenario.dispatchEvent(new p.window.MouseEvent('mouseleave'))
-    assert.equal(p.scenario.dataset.playback, 'playing')
-    Object.defineProperty(p.doc, 'hidden', { value: true, configurable: true })
-    p.doc.dispatchEvent(new p.window.Event('visibilitychange'))
-    assert.equal(p.scenario.dataset.playback, 'paused')
-    Object.defineProperty(p.doc, 'hidden', { value: false, configurable: true })
-    p.doc.dispatchEvent(new p.window.Event('visibilitychange'))
-    assert.equal(p.scenario.dataset.playback, 'playing')
-    assert.equal(p.doc.querySelector('[data-status]').textContent, '2 / 5')
-  } finally { p.dom.window.close() }
-})
-
-test('keyboard navigation, focus and transcript mode keep playback under user control', () => {
-  const p = page()
-  try {
-    p.inView(true)
-    p.doc.querySelector('[data-next]').focus()
-    assert.equal(p.scenario.dataset.playback, 'playing')
-    p.scenario.dispatchEvent(new p.window.KeyboardEvent('keydown', { key: 'End', bubbles: true }))
-    assert.equal(p.doc.querySelector('[data-status]').textContent, '5 / 5')
-    p.doc.querySelector('[data-mode="order"]').click()
-    assert.ok(p.scenario.classList.contains('is-order'))
-    assert.equal(p.doc.querySelector('[data-mode="order"]').getAttribute('aria-pressed'), 'true')
-    assert.equal(p.scenario.dataset.playback, 'paused')
-  } finally { p.dom.window.close() }
-})
-
-test('reduced motion defaults to a readable transcript without automatic playback', () => {
-  const p = page({ reduced: true })
-  try {
-    p.inView(true)
-    assert.ok(p.scenario.classList.contains('is-order'))
-    p.doc.querySelector('[data-mode="auto"]').click()
-    assert.equal(p.scenario.dataset.playback, 'paused')
-    assert.equal([...p.timers.values()].some(value => value.delay >= 2800), false)
-  } finally { p.dom.window.close() }
-})
-
-test('glyph background renders, caps frame rate, and stops drawing in a hidden page', () => {
-  const p = page()
-  try {
-    const canvas = p.doc.getElementById('emberBackground')
-    assert.equal(canvas.getAttribute('aria-hidden'), 'true')
-    assert.equal(canvas.dataset.state, 'running')
-    assert.ok(p.emberDraws() > 0)
-    p.runFrame(100)
-    const draws = p.emberDraws()
-    p.runFrame(110)
-    assert.equal(p.emberDraws(), draws, 'frames within 50ms should not repaint the glyph field')
-    Object.defineProperty(p.doc, 'hidden', { value: true, configurable: true })
-    p.doc.dispatchEvent(new p.window.Event('visibilitychange'))
-    p.runFrame(200)
-    assert.equal(canvas.dataset.state, 'paused')
-    assert.equal(p.emberDraws(), draws)
-    Object.defineProperty(p.doc, 'hidden', { value: false, configurable: true })
-    p.doc.dispatchEvent(new p.window.Event('visibilitychange'))
-    assert.equal(canvas.dataset.state, 'running')
-  } finally { p.dom.window.close() }
-})
-
-test('glyph background switches to a static frame when reduced motion is enabled', () => {
-  const p = page()
-  try {
-    p.setMotion(true)
-    assert.equal(p.doc.getElementById('emberBackground').dataset.state, 'static')
-    const draws = p.emberDraws()
-    p.runFrame(200)
-    assert.equal(p.emberDraws(), draws)
-    p.setMotion(false)
-    assert.equal(p.doc.getElementById('emberBackground').dataset.state, 'running')
-  } finally { p.dom.window.close() }
-})
-
-test('fire has a dense bright bed, mixed letter glyphs, and uneven flame tips', () => {
-  const p = page()
-  try {
-    const samples = p.glyphSamples()
-    const height = p.window.innerHeight
-    const bed = samples.filter(sample => sample.y > height - 12)
-    assert.ok(bed.length > 100, 'the bed should be a continuous dense band')
-    assert.ok(bed.every(sample => sample.color === 'rgb(255,250,232)'), 'the bed should burn ivory-white')
-    assert.ok(new Set(samples.map(sample => sample.glyph)).size > 20, 'fire should use a varied ASCII density ramp')
-    const tips = new Map()
-    samples.forEach(sample => tips.set(sample.x, Math.min(tips.get(sample.x) ?? Infinity, sample.y)))
-    assert.ok(Math.max(...tips.values()) - Math.min(...tips.values()) > height * 0.15, 'flame tongues should reach different heights')
-    const first = samples.map(sample => sample.color + sample.glyph).join('')
-    p.runFrame(100)
-    p.runFrame(1100)
-    assert.notEqual(p.glyphSamples().map(sample => sample.color + sample.glyph).join(''), first)
-  } finally { p.dom.window.close() }
+    assert.equal(doc.documentElement.lang, 'en')
+    pick('gemini')
+    assert.equal(value('quota'), 'Not reported')
+    doc.getElementById('language').click()
+    assert.equal(doc.documentElement.lang, 'zh-CN')
+    assert.equal(value('quota'), '本例未报告')
+    assert.equal(doc.querySelector('[data-agent="gemini"]').getAttribute('aria-pressed'), 'true')
+    doc.getElementById('theme').click()
+    assert.equal(doc.documentElement.dataset.theme, 'dark')
+    doc.getElementById('theme').click()
+    assert.equal(doc.documentElement.dataset.theme, 'light')
+  } finally { dom.window.close() }
 })

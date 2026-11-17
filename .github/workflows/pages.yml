@@ -24,8 +24,10 @@ jobs:
       - uses: actions/configure-pages@v5
       - name: Collect public website files
         run: |
-          mkdir "$RUNNER_TEMP/site"
-          cp -r meldwork-landing/{assets,index.html,styles.css,main.js,i18n.js,glyph-embers.js,LICENSE,NOTICE,COMMERCIAL_USE.md} "$RUNNER_TEMP/site/"
+          mkdir -p "$RUNNER_TEMP/site/assets/screenshots"
+          cp meldwork-landing/{index.html,styles.css,main.js,i18n.js,LICENSE,NOTICE,COMMERCIAL_USE.md} "$RUNNER_TEMP/site/"
+          cp meldwork-landing/assets/multiwork-icon.svg "$RUNNER_TEMP/site/assets/"
+          cp meldwork-landing/assets/screenshots/multiwork-conversation.png "$RUNNER_TEMP/site/assets/screenshots/"
       - uses: actions/upload-pages-artifact@v3
         with:
           path: ${{ runner.temp }}/site
