@@ -85,7 +85,8 @@ test('selected native directories control Skill discovery and Codex plugin looku
   assert.deepEqual(catalog.list('deepseek').skills.map(skill => skill.slug).sort(), ['deepseek-new', 'shared'])
   assert.deepEqual(catalog.list('codex').skills.map(skill => skill.slug).sort(), ['codex-new', 'plugin-skill', 'shared'])
   const skill = catalog.list('hermes').skills[0]
-  assert.ok(catalog.resolveSelections('hermes', [skill])[0].sourceDirectory.startsWith(fs.realpathSync(selected.hermes)))
+  assert.equal(catalog.resolveSelections('hermes', [skill])[0].sourceDirectory,
+    fs.realpathSync.native(path.join(selected.hermes, 'skills', 'hermes-new')))
   selected.hermes = ''
   catalog.invalidate('hermes')
   assert.deepEqual(catalog.list('hermes').skills.map(item => item.slug), ['hermes-old'])
@@ -107,7 +108,8 @@ test('Gemini and OpenCode discover skills in configured native locations', t => 
   assert.deepEqual(catalog.list('opencode').skills.map(skill => skill.slug).sort(),
     ['global-opencode', 'selected-opencode', 'selected-opencode-singular'])
   const skill = catalog.list('gemini').skills[0]
-  assert.ok(catalog.resolveSelections('gemini', [skill])[0].sourceDirectory.startsWith(fs.realpathSync(geminiHome)))
+  assert.equal(catalog.resolveSelections('gemini', [skill])[0].sourceDirectory,
+    fs.realpathSync.native(path.join(geminiHome, '.gemini', 'skills', 'selected-gemini')))
   selected.gemini = ''
   catalog.invalidate('gemini')
   assert.deepEqual(catalog.list('gemini').skills.map(item => item.slug), ['old-gemini'])
