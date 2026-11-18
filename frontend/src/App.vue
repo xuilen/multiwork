@@ -82,6 +82,7 @@
         >
           <TaskBoard :snapshot="snapshot" :gates="awaitingDecisionGates" :group-name="groupName"
             :agents="mergedCatalog" @open-task="openBoardTask" />
+          <WorkspaceUsage :messages="snapshot.messages" :agents="mergedCatalog" />
         </HomeDashboard>
 
         <section v-else class="conversation-pane">
@@ -208,6 +209,7 @@ import ConversationHeader from './components/ConversationHeader.vue'
 import ConversationTimelineView from './components/ConversationTimelineView.vue'
 import HomeDashboard from './components/HomeDashboard.vue'
 import TaskBoard from './components/TaskBoard.vue'
+import WorkspaceUsage from './components/WorkspaceUsage.vue'
 import OnboardingDialog from './components/OnboardingDialog.vue'
 import RunTracePanel from './components/RunTracePanel.vue'
 import SystemSettingsView from './components/SystemSettingsView.vue'

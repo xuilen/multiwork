@@ -902,6 +902,7 @@ import {
   WarningOutline,
 } from '@vicons/ionicons5'
 import { agentLabel as defaultAgentLabel, agentLogo, isCloudAgentKind } from '../catalog.js'
+import { quotaPeriodLabel, quotaWindows, summarizeAgentUsage } from '../agentUsage.js'
 import { skillKey } from '../composables/useComposerContext.js'
 import { orchestrationSlotCompleted } from '../desktop-normalization.js'
 import { locale } from '../i18n.js'
@@ -1029,29 +1030,9 @@ function participantActivity(kind) {
     ['tool_start', 'tool_update', 'tool_result_summary', 'plan', 'warning', 'reasoning_summary'].includes(item.type))
   return event ? (event.summary || traceEventTitle(event) || traceEventTypeLabel(event.type)).slice(0, 160) : ''
 }
-const conversationUsage = computed(() => {
-  const byKind = new Map()
-  const encoder = new TextEncoder()
-  for (const message of props.controller.activeMessages?.value || []) {
-    if (message.role !== 'agent' || !message.agentKind) continue
-    const kind = message.agentKind
-    const row = byKind.get(kind) || { kind, metrics: {}, total: 0, reported: 0, estimated: {} }
-    row.total++
-    const metrics = message.trace?.context
-    if (Number.isSafeInteger(metrics?.inputTokens) || Number.isSafeInteger(metrics?.outputTokens)) row.reported++
-    for (const key of ['inputTokens', 'outputTokens']) {
-      if (Number.isSafeInteger(metrics?.[key])) row.metrics[key] = (row.metrics[key] || 0) + metrics[key]
-    }
-    if (!Number.isSafeInteger(metrics?.inputTokens) && metrics?.promptBytes > 0) {
-      row.estimated.inputTokens = (row.estimated.inputTokens || 0) + Math.ceil(metrics.promptBytes / 4)
-    }
-    if (!Number.isSafeInteger(metrics?.outputTokens) && message.content) {
-      row.estimated.outputTokens = (row.estimated.outputTokens || 0) + Math.ceil(encoder.encode(message.content).length / 4)
-    }
-    byKind.set(kind, row)
-  }
-  return [...byKind.values()]
-})
+const conversationUsage = computed(() => summarizeAgentUsage(
+  props.controller.activeMessages?.value || [], { estimateMissing: true },
+))
 async function stopParticipant(kind) {
   const run = activeRun.value
   const id = displayedRunAgentForKind(kind)?.agentRunId
@@ -1067,14 +1048,8 @@ function usageLabel(context) {
   for (const key of ['inputTokens', 'outputTokens']) {
     if (Number.isSafeInteger(context[key])) parts.push(t('run.' + key, { count: context[key].toLocaleString(locale.value) }))
   }
-  for (const index of [1, 2]) {
-    const minutes = context['quotaMinutes' + index]
-    const percent = context['quotaRemaining' + index]
-    if (minutes && Number.isFinite(percent)) {
-      const period = minutes % 1440 === 0 ? t('run.days', { count: minutes / 1440 })
-        : minutes % 60 === 0 ? t('run.hours', { count: minutes / 60 }) : t('run.minutes', { count: minutes })
-      parts.push(t('run.quotaSnapshot', { period, percent }))
-    }
+  for (const { minutes, percent } of quotaWindows(context)) {
+    parts.push(t('run.quotaSnapshot', { period: quotaPeriodLabel(minutes, t), percent }))
   }
   return parts.join(' · ')
 }

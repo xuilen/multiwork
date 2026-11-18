@@ -40,6 +40,8 @@ Conversation history and task state stay on your machine. Selected agents contac
 
 ## Run from source
 
+The source build includes an **Agent token usage** panel on Home. Choose Today, Last 7 days or All time to compare input and output across saved conversations. The reporting fraction counts replies with at least one token count; a dash means the Agent did not report that value. If a reply in the period includes quota windows, the panel shows the most recent such reply and its timestamp. This is a saved snapshot, not a live account balance.
+
 Use Node.js 22.12 or newer and npm. From the repository root, run the following commands.
 
 ```sh
