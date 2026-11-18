@@ -64,7 +64,7 @@ test('OpenCodeReview selects its native configuration directory and parent home'
   assert.deepEqual(nativeConfigEnvironment('opencodereview', preferences, {}, 'win32'), { HOME: home, USERPROFILE: home })
   const windows = nativeConfigEnvironment('opencodereview', preferences, {}, 'win32')
   assert.equal(childEnvironment({ kind: 'opencodereview' }, home, { env: windows }, 'win32').USERPROFILE, home)
-  assert.equal(nativeIdentityDirectory('opencodereview', { HOME: home }, '/other', 'linux'), directory)
+  assert.equal(nativeIdentityDirectory('opencodereview', selected, home), directory)
   assert.throws(() => nativeConfigEnvironment('opencodereview', { opencodereview: { nativeConfigDirectory: home } }),
     { message: 'LOCAL_NATIVE_CONFIG_INVALID' })
   if (process.platform !== 'win32') {
@@ -115,7 +115,7 @@ test('Zcode selects only a native .zcode/cli directory and derives its process h
   const preferences = { zcode: { nativeConfigDirectory: directory } }
   assert.equal(nativeConfigEnvironment('zcode', preferences, { HOME: '/old' }).HOME, path.resolve(home))
   assert.deepEqual(nativeConfigEnvironment('zcode', preferences, {}, 'win32'), { HOME: path.resolve(home), USERPROFILE: path.resolve(home) })
-  assert.equal(nativeIdentityDirectory('zcode', { HOME: path.resolve(home) }, '/other', 'linux'), directory)
+  assert.equal(nativeIdentityDirectory('zcode', nativeConfigEnvironment('zcode', preferences), home), directory)
   assert.equal(nativeIdentityDirectory('zcode', { USERPROFILE: 'C:\\Users\\Selected' }, 'C:\\Other', 'win32'),
     'C:\\Users\\Selected\\.zcode\\cli')
   assert.throws(() => nativeConfigEnvironment('zcode', { zcode: { nativeConfigDirectory: home } }), { message: 'LOCAL_NATIVE_CONFIG_INVALID' })
@@ -142,10 +142,11 @@ test('Qwen selects a native .qwen directory and derives its process home', t => 
   const preferences = { qwen: { nativeConfigDirectory: directory } }
   assert.equal(nativeConfigEnvironment('qwen', preferences, { HOME: '/old' }).HOME, path.resolve(home))
   assert.deepEqual(nativeConfigEnvironment('qwen', preferences, {}, 'win32'), { HOME: path.resolve(home), USERPROFILE: path.resolve(home) })
-  assert.equal(nativeIdentityDirectory('qwen', { HOME: path.resolve(home) }, '/other', 'linux'), directory)
-  const identityFiles = nativeAuthIdentityFiles('qwen', { HOME: path.resolve(home) }, '/other', 'linux')
+  const selectedEnvironment = nativeConfigEnvironment('qwen', preferences)
+  assert.equal(nativeIdentityDirectory('qwen', selectedEnvironment, home), directory)
+  const identityFiles = nativeAuthIdentityFiles('qwen', selectedEnvironment, path.join(home, 'other'))
   assert.ok(identityFiles.includes(path.join(directory, 'settings.json')))
-  assert.equal(identityFiles.includes('/other/.qwen/settings.json'), false)
+  assert.equal(identityFiles.includes(path.join(home, 'other', '.qwen', 'settings.json')), false)
   assert.equal(nativeIdentityDirectory('qwen', { USERPROFILE: 'C:\\Users\\Selected' }, 'C:\\Other', 'win32'),
     'C:\\Users\\Selected\\.qwen')
   assert.throws(() => nativeConfigEnvironment('qwen', { qwen: { nativeConfigDirectory: home } }), { message: 'LOCAL_NATIVE_CONFIG_INVALID' })
@@ -213,7 +214,8 @@ test('native identity directories follow shell overrides and known defaults', ()
   assert.equal(nativeIdentityDirectory('kimi', { KIMI_CODE_HOME: selected }, home, 'linux'), selected)
   assert.equal(nativeIdentityDirectory('kimi', { KIMI_CODE_HOME: 'relative' }, home, 'linux'), '')
   assert.equal(nativeIdentityDirectory('hermes', { HERMES_DATA_DIR_SUFFIX: '-test' }, home, 'linux'), path.join(home, '.hermes-test'))
-  assert.equal(nativeIdentityDirectory('hermes', { HERMES_HOME: '~/profiles/work' }, home, 'linux'), path.join(home, 'profiles', 'work'))
+  assert.equal(path.normalize(nativeIdentityDirectory('hermes', { HERMES_HOME: '~/profiles/work' }, home, 'linux')),
+    path.join(home, 'profiles', 'work'))
   assert.equal(nativeIdentityDirectory('unknown', {}, home, 'linux'), '')
 })
 
@@ -256,14 +258,14 @@ test('OpenCode authentication identity follows its XDG data directory', () => {
   const cloud = [path.join(home, '.local', 'state', 'opencode', 'model.json'),
     path.join(home, '.cache', 'opencode', 'models.json'),
     path.join(home, '.aws', 'config'), path.join(home, '.aws', 'credentials'),
-    path.join(home, '.config', 'gcloud', 'application_default_credentials.json')]
+    ...(process.platform === 'win32' ? [] : [path.join(home, '.config', 'gcloud', 'application_default_credentials.json')])]
   assert.deepEqual(nativeAuthIdentityFiles('opencode', {}, home), [path.join(home, '.local', 'share', 'opencode', 'auth.json'), ...shared, ...cloud])
   assert.deepEqual(nativeAuthIdentityFiles('opencode', { XDG_DATA_HOME: path.join(home, 'data') }, home),
     [path.join(home, 'data', 'opencode', 'auth.json'), ...shared, ...cloud])
   assert.deepEqual(nativeAuthIdentityFiles('opencode', { XDG_DATA_HOME: 'relative' }, home), [...shared, ...cloud])
   assert.deepEqual(nativeAuthIdentityFiles('opencode', { OPENCODE_CONFIG: path.join(home, 'custom.json') }, home),
     [path.join(home, '.local', 'share', 'opencode', 'auth.json'), path.join(home, 'custom.json'), ...shared, ...cloud])
-  assert.deepEqual(nativeAuthIdentityFiles('opencode', { OPENCODE_CONFIG: '~/custom.json' }, home),
+  assert.deepEqual(nativeAuthIdentityFiles('opencode', { OPENCODE_CONFIG: '~/custom.json' }, home).map(filename => path.normalize(filename)),
     [path.join(home, '.local', 'share', 'opencode', 'auth.json'), path.join(home, 'custom.json'), ...shared, ...cloud])
   const customCache = path.join(home, 'custom-cache')
   assert.ok(nativeAuthIdentityFiles('opencode', { XDG_CACHE_HOME: customCache }, home)
@@ -298,7 +300,7 @@ test('project config identities retain only relative CLI paths', () => {
   assert.deepEqual(nativeProjectConfigPaths('codex', { OPENCODE_CONFIG: 'custom.json' }), [])
   assert.deepEqual(nativeProjectConfigPaths('gemini', { GEMINI_CLI_SYSTEM_SETTINGS_PATH: 'system/settings.json',
     GOOGLE_APPLICATION_CREDENTIALS: 'credentials.json' }), [
-    { value: 'system/settings.json', directory: false }, { value: 'system/system-defaults.json', directory: false },
+    { value: 'system/settings.json', directory: false }, { value: path.join('system', 'system-defaults.json'), directory: false },
     { value: 'credentials.json', directory: false },
   ])
   assert.deepEqual(nativeProjectConfigPaths('qwen', { QWEN_CODE_SYSTEM_SETTINGS_PATH: 'qwen/settings.json',
@@ -369,7 +371,9 @@ test('Hermes verification tracks native cloud credential files', t => {
   fs.writeFileSync(filename, 'first')
   const agent = { kind: 'hermes' }
   Object.defineProperty(agent, NATIVE_AUTH_IDENTITY_FILES, {
-    value: nativeAuthIdentityFiles('hermes', { VERTEX_CREDENTIALS_PATH: filename }, home),
+    value: nativeAuthIdentityFiles('hermes', {
+      VERTEX_CREDENTIALS_PATH: filename, CLOUDSDK_CONFIG: path.join(home, '.config', 'gcloud'),
+    }, home),
   })
   assert.ok(agent[NATIVE_AUTH_IDENTITY_FILES].includes(path.join(home, '.config', 'gcloud', 'application_default_credentials.json')))
   const before = agentVerificationIdentity(agent)
@@ -382,12 +386,14 @@ test('Pi and Claude identity tracks explicitly selected absolute cloud credentia
   const aws = path.join(home, 'aws', 'credentials')
   const azure = path.join(home, 'azure', 'token')
   const env = { AWS_SHARED_CREDENTIALS_FILE: aws, AZURE_FEDERATED_TOKEN_FILE: azure,
-    GOOGLE_APPLICATION_CREDENTIALS: 'relative.json' }
+    GOOGLE_APPLICATION_CREDENTIALS: 'relative.json', CLOUDSDK_CONFIG: path.join(home, '.config', 'gcloud') }
   const config = path.join(home, '.aws', 'config')
   const adc = path.join(home, '.config', 'gcloud', 'application_default_credentials.json')
   assert.deepEqual(nativeAuthIdentityFiles('pi', env, home), [config, aws, adc])
   assert.deepEqual(nativeAuthIdentityFiles('claude', env, home), [config, aws, azure])
-  assert.deepEqual(nativeAuthIdentityFiles('pi', { AWS_CONFIG_FILE: 'relative-config' }, home),
+  assert.deepEqual(nativeAuthIdentityFiles('pi', {
+    AWS_CONFIG_FILE: 'relative-config', CLOUDSDK_CONFIG: path.join(home, '.config', 'gcloud'),
+  }, home),
     [path.join(home, '.aws', 'credentials'), adc])
 })
 
@@ -502,10 +508,11 @@ test('Gemini authentication identity includes explicitly selected system and clo
   assert.deepEqual(nativeAuthIdentityFiles('gemini', {
     GEMINI_CLI_SYSTEM_SETTINGS_PATH: 'relative', GOOGLE_APPLICATION_CREDENTIALS: 'relative',
   }, home), [path.join(home, '.env')])
-  assert.deepEqual(nativeAuthIdentityFiles('gemini', {}, home, 'darwin'), [
+  const macHome = '/Users/test-home'
+  assert.deepEqual(nativeAuthIdentityFiles('gemini', {}, macHome, 'darwin'), [
     '/Library/Application Support/GeminiCli/settings.json',
     '/Library/Application Support/GeminiCli/system-defaults.json',
-    path.join(home, '.config', 'gcloud', 'application_default_credentials.json'), path.join(home, '.env'),
+    path.posix.join(macHome, '.config', 'gcloud', 'application_default_credentials.json'), path.posix.join(macHome, '.env'),
   ])
   assert.deepEqual(nativeAuthIdentityFiles('gemini', { APPDATA: 'C:\\Users\\User\\AppData\\Roaming' }, 'C:\\Users\\User', 'win32'), [
     'C:\\ProgramData\\gemini-cli\\settings.json', 'C:\\ProgramData\\gemini-cli\\system-defaults.json',
@@ -516,7 +523,7 @@ test('Gemini authentication identity includes explicitly selected system and clo
 test('Qwen authentication identity tracks its native user and system settings', () => {
   const home = path.resolve('test-home')
   const settings = path.join(home, 'system', 'qwen.json')
-  assert.deepEqual(nativeAuthIdentityFiles('qwen', { QWEN_CODE_SYSTEM_SETTINGS_PATH: settings }, home, 'darwin'), [
+  assert.deepEqual(nativeAuthIdentityFiles('qwen', { QWEN_CODE_SYSTEM_SETTINGS_PATH: settings }, home), [
     settings, path.join(home, 'system', 'system-defaults.json'),
     path.join(home, '.qwen', 'settings.json'), path.join(home, '.qwen', 'oauth_creds.json'), path.join(home, '.qwen', '.env'),
     path.join(home, '.qwen', 'trustedFolders.json'), path.join(home, '.env'),

@@ -18,7 +18,7 @@ test('packaged Electron disables runtime injection and enforces app.asar integri
 })
 
 test('public release config requires signing, Developer ID verification, and notarization', () => {
-  assert.equal(publicBuild.appId, 'com.rydersun.meldwork')
+  assert.equal(publicBuild.appId, 'local.multiwork.studio')
   assert.equal(publicBuild.forceCodeSigning, true)
   assert.equal(publicBuild.afterSign, 'scripts/after-sign.cjs')
   assert.equal(publicBuild.mac.notarize, true)

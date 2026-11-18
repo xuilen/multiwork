@@ -7,6 +7,7 @@ const { EventEmitter } = require('node:events')
 const { PassThrough } = require('node:stream')
 const { launchEnvironment, probeAgentCapabilities } = require('../../../src/agents/cli/cli-discovery.cjs')
 const {
+  ALLOWED_KINDS,
   detectAgents,
   imageAttachmentLimit,
   invocation,
@@ -526,10 +527,10 @@ test('Agent discovery scans independent Agent kinds concurrently', async () => {
   })
 
   await new Promise(resolve => setImmediate(resolve))
-  const startedBeforeRelease = started.length
+  const startedBeforeRelease = [...started]
   release()
   assert.deepEqual(await detection, [])
-  assert.equal(startedBeforeRelease, 14)
+  assert.deepEqual(startedBeforeRelease.sort(), [...ALLOWED_KINDS].sort())
 })
 
 test('Hermes capability and ACP checks run concurrently without changing the result', async () => {

@@ -1527,7 +1527,7 @@ test('ready activates one fixed local workspace and loads the bundled frontend',
   assert.deepEqual(harness.attachmentInstances[0].cleanupCalls, [[]])
   assert.equal(harness.windows.length, 1)
   assert.equal(harness.windows[0].input.icon?.isEmpty?.(), false)
-  assert.match(harness.nativeImagePathCalls[0], /frontend[\\/]public[\\/]logos[\\/]meldwork-app\.png$/)
+  assert.match(harness.nativeImagePathCalls[0], /frontend[\\/]public[\\/]logos[\\/]multiwork-icon\.png$/)
   if (process.platform === 'darwin') assert.equal(harness.dockIconCalls.length, 1)
   assert.equal(
     harness.windows[0].input.backgroundColor,

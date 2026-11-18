@@ -77,6 +77,10 @@ input.on('line', line => {
       modes: { currentModeId: 'default', availableModes: ['default', 'plan'] },
     } })
   } else if (msg.method === 'session/resume') {
+    if (msg.params?.sessionId === 'expired-session') {
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32001, message: 'Saved session was not found or has expired.' } })
+      return
+    }
     if (msg.params?.sessionId !== 'agy-sess-1') process.exit(2)
     send({ jsonrpc: '2.0', id: msg.id, result: {
       modes: { currentModeId: 'default', availableModes: ['default', 'plan'] },
@@ -157,6 +161,13 @@ input.on('line', line => {
     onPermissionRequest: () => ({ status: 'approved', optionId: 'allow' }),
   })
   assert.equal(resumed.text, 'decision=allow;image=true')
+
+  await assert.rejects(
+    runAgent(agent, 'resume', directory, { sandbox: 'read-only', sessionRef: 'expired-session' }),
+    error => error.code === 'LOCAL_AGENT_SESSION_INVALID'
+      && error.failure.sessionInvalid === true
+      && error.failure.retryable === true,
+  )
 
   await assert.rejects(
     runAgent(agent, 'unauth', directory, { sandbox: 'read-only' }),

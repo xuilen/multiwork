@@ -1869,8 +1869,8 @@ test('every supported built-in Agent produces an explicit completion outcome', (
     }),
   }
 
-  // DeepSeek uses ACP exclusively and is covered by deepseek-acp.test.cjs.
-  const outputKinds = ALLOWED_KINDS.filter(kind => kind !== 'deepseek')
+  // ACP-only Agents are covered by deepseek-acp.test.cjs and antigravity-acp.test.cjs.
+  const outputKinds = ALLOWED_KINDS.filter(kind => !['deepseek', 'antigravity'].includes(kind))
   assert.deepEqual(Object.keys(outputs).sort(), [...outputKinds].sort())
   for (const kind of outputKinds) {
     const result = profileOutput(
@@ -2094,7 +2094,7 @@ test('recorded fixtures cover every supported built-in output schema', () => {
   assert.equal(manifest.schemaVersion, 1)
   assert.deepEqual(
     manifest.fixtures.map(fixture => fixture.kind).sort(),
-    ALLOWED_KINDS.filter(kind => kind !== 'deepseek').sort(),
+    ALLOWED_KINDS.filter(kind => !['deepseek', 'antigravity'].includes(kind)).sort(),
   )
   const expectedText = {
     zcode: 'Zcode fixture reply',
@@ -2174,7 +2174,9 @@ process.exit(2)
       ...(kind === 'kimi' ? { sandbox: 'workspace-write' } : {}),
     }
     await assert.rejects(
-      runAgent({ kind, executable: kind === 'kimi' ? executable(directory, 'invalid-kimi-session.cjs', kimiAcpSource("''", true)) : cli, name: kind }, 'resume', directory, options),
+      runAgent({ kind, executable: ['kimi', 'antigravity'].includes(kind)
+        ? executable(directory, 'invalid-acp-session.cjs', kimiAcpSource("''", true))
+        : cli, name: kind }, 'resume', directory, options),
       (error) => error.message === 'LOCAL_AGENT_SESSION_INVALID'
         && error.failure.sessionInvalid === true
         && error.failure.retryable === true,
@@ -2354,6 +2356,7 @@ process.stdout.write(JSON.stringify({ type: 'turn.completed' }) + '\\n')
 `,
     expected: {
       text: 'Codex final after limit', sessionRef: 'codex-long-session', outcome: 'completed',
+      quotaSnapshot: {},
       progress: [{ id: 'turn', title: 'process', status: 'completed' }],
     },
   }, {
