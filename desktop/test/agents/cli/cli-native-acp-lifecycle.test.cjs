@@ -1134,11 +1134,12 @@ if (args[commandOffset] === 'gateway' && args[commandOffset + 1] === 'health') {
   process.exit(0)
 }
 if (args[commandOffset] === 'gateway' && args[commandOffset + 1] === 'run') {
-  fs.writeFileSync(${JSON.stringify(gatewayStartedFile)}, 'started')
   process.on('SIGTERM', () => {
     fs.writeFileSync(${JSON.stringify(gatewayStoppedFile)}, 'stopped')
     process.exit(0)
   })
+  // Publish startup only once the shutdown handler is ready to receive SIGTERM.
+  fs.writeFileSync(${JSON.stringify(gatewayStartedFile)}, 'started')
   const ready = () => {
     if (!fs.existsSync(${JSON.stringify(releaseFile)})) return setTimeout(ready, 10)
     process.stdout.write('[gateway] ready\\n')
